@@ -1,0 +1,57 @@
+﻿
+# Environnement virtuel
+
+venv/
+
+.venv/
+
+# Cache Python
+
+__pycache__/
+
+*.pyc
+
+# ChromaDB
+
+chroma_db/
+
+*.chroma
+
+# Variables d'environnement
+
+.env
+
+.env.example
+
+# Dossiers à ne PAS pusher
+
+test-repo/
+
+orchestrator/
+
+test/
+
+.claude/
+
+# Fichiers racine à ne PAS pusher
+
+main.py
+
+gitlab_connector.py
+
+test_gitlab_integration.py
+
+test_real_gitlab.py
+
+test_
+
+requirements_mod1.txt
+
+# Cache HuggingFace et modèles
+
+.cache/
+
+*.onnx
+
+*.tar.gz
+

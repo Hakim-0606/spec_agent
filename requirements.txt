@@ -1,0 +1,53 @@
+# ── Core agent framework ──────────────────────────────────────────────────────
+langgraph>=0.2.50
+langchain-core>=0.2.0
+
+# ── Phase 1 — BM25 + Embeddings + RRF ────────────────────────────────────────
+rank-bm25>=0.2.2
+
+# ── Phase 2 — AST parsing + call graph + diff signal ─────────────────────────
+tree-sitter>=0.22
+tree-sitter-python>=0.23
+tree-sitter-javascript>=0.23
+tree-sitter-typescript>=0.23
+tree-sitter-java>=0.23
+tree-sitter-go>=0.23
+networkx>=3.3
+
+# ── Phase 3 — RAG + vector store ─────────────────────────────────────────────
+sentence-transformers>=3.0.0
+chromadb>=0.5.0
+torch>=2.3.0
+transformers>=4.40.0
+accelerate>=0.30.0
+
+# ── Phase 4 — LLM local via Ollama ───────────────────────────────────────────
+ollama>=0.3.0
+
+# ── Modification 1 — Embedding indexer ───────────────────────────────────────
+# sentence-transformers + chromadb déjà listés ci-dessus
+# Modèle recommandé : nomic-embed-text v1.5 (via sentence-transformers)
+# Fallback léger   : all-MiniLM-L6-v2 (déjà téléchargé dans ton venv)
+
+# ── Modification 2 — Diff signal extractor ───────────────────────────────────
+# Pas de dépendance nouvelle — stdlib uniquement (re, pathlib)
+
+# ── Modification 3 — Structured output + validation ──────────────────────────
+pydantic>=2.7.0
+
+# ── Checkpointing ────────────────────────────────────────────────────────────
+psycopg[binary]>=3.1.0
+langgraph-checkpoint-postgres>=1.0.4
+
+# ── GitLab integration + API ─────────────────────────────────────────────────
+python-gitlab>=4.9.0
+fastapi>=0.111.0
+uvicorn>=0.30.0
+python-dotenv>=1.0.0
+
+# ── Messaging / event bus ────────────────────────────────────────────────────
+kafka-python>=2.0.2
+
+# ── Utilitaires ──────────────────────────────────────────────────────────────
+httpx>=0.27.0
+typing-extensions>=4.11.0
