@@ -7,6 +7,16 @@ class SpecState(TypedDict):
     mr_diff: str       # Raw unified diff of the MR
     repo_path: str     # Absolute path to the locally cloned repo
 
+    # ── LLM override ──────────────────────────────────────────────────────────
+    llm_model: str   # Ollama model name — optionnel, défaut via $OLLAMA_MODEL
+
+    # ── Phase 0 — Workspace & Project Structure ───────────────────────────────
+    # Carte structurelle complète du projet extraite avant BM25.
+    # {repo_path, project_name, summary:{total_files,functions,classes,languages},
+    #  files:[{path,language,classes,functions,loc}], tree:{dir/:{...}}}
+    # Vide ({}) si le projet est introuvable dans workspace/.
+    project_structure: dict
+
     # ── Phase 1 — BM25 ────────────────────────────────────────────────────────
     keywords: list     # Tokens extracted from ticket + diff
     bm25_files: list   # Top-10 candidate files: [{"file": str, "score": float}]
@@ -26,6 +36,11 @@ class SpecState(TypedDict):
 
     # ── Phase 3 — RAG ─────────────────────────────────────────────────────────
     rag_contexts: list  # Top-3 re-ranked by semantic similarity
+
+    # ── Phase 3.5 — Tools déterministes ───────────────────────────────────────
+    # Résultats de search_in_repo : [{file, line, content, match}, …]
+    # Vide si tools non disponibles ou aucun résultat.
+    tool_search_results: list
 
     # ── Phase 4 — LLM + Reflexion ─────────────────────────────────────────────
     # Full location document for the Agent Coder.  All 13 fields:

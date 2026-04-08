@@ -14,7 +14,6 @@ Budget: max 2 LLM calls per execution.
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -26,36 +25,53 @@ REFLEXION_THRESHOLD = 0.7
 # ── Prompt templates ───────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
-You are an expert software engineer specialised in bug localisation.
-You will receive a bug ticket, a merge-request diff, candidate functions with
-their full source code, a code snippet extracted around the suspected bug line,
-and pre-built patch constraints.
+You are an expert software engineer specialised in bug localisation for an automated repair pipeline.
+Your output is consumed directly by an Agent Coder that will write the fix — precision is critical.
 
-Your tasks:
-1. Identify the SINGLE function that contains the root cause of the bug.
-2. Produce a complete analysis document to guide the Agent Coder that will fix it.
+## What you receive
+- A bug ticket (ID, title, description, severity, component)
+- A merge-request diff (the change that introduced or exposed the bug)
+- Up to 3 candidate functions with full source, ranked by relevance (Candidate 1 = highest)
+- A code snippet centred on the most likely bug line
+- Pre-built patch constraints (scope, test files, forbidden files, style)
 
-Respond ONLY with valid JSON matching this exact schema — no prose, no markdown fences:
+## Reasoning steps (follow in order — do NOT output this section)
+1. Read the diff: +/- lines are the strongest signal. Which candidate does the diff touch?
+2. Read that candidate's source. Find the exact line(s) where the logic is wrong.
+3. Check callers and callees: could the bug be one level up (bad input) or down (broken helper)?
+4. Assign confidence using the calibration scale below.
+
+## Confidence calibration
+0.90 – 1.00 : Buggy line visible in both the diff and the function source.
+0.70 – 0.89 : Strong match between diff and candidate; exact line is inferred.
+0.50 – 0.69 : Plausible match; list fallback_locations for the Coder.
+Below 0.50  : Evidence weak — reflexion will trigger a second analysis automatically.
+
+## Output — respond ONLY with valid JSON, no prose, no markdown fences
 {
-  "file":               "<relative file path>",
-  "function":           "<function name>",
-  "line":               <integer line number>,
-  "root_cause":         "<one-sentence explanation of the root cause>",
-  "confidence":         <float 0.0-1.0>,
-  "problem_summary":    "<2-3 sentences. Format strictly: Comportement observé: [X]. Comportement attendu: [Y]. Condition de déclenchement: [Z].>",
-  "code_context":       "<the provided code snippet with # BUG: or # PROBLÈME: inline comments added on the buggy lines — max 20 lines total>",
-  "patch_constraints":  {
-    "scope":            "<confirm or refine: modify only function() in file>",
-    "preserve_tests":   [<list of test file paths that must not break — keep the pre-built list, add any you identify>],
-    "forbidden_files":  [<list of file paths the Coder must not touch — keep the pre-built list>],
-    "style_hint":       "<confirm or refine the detected code style conventions>"
+  "file":             "<relative path from repo root — forward slashes>",
+  "function":         "<exact function or method name as it appears in the source>",
+  "line":             <integer: 1-based line number of the root cause; 0 if unknown>,
+  "root_cause":       "<one precise sentence stating WHAT is wrong and WHY — e.g. 'Off-by-one in slice index silently drops the last element when the list is non-empty'>",
+  "confidence":       <float 0.0–1.0 calibrated to the scale above>,
+  "problem_summary":  "Observed behaviour: [what the system currently does wrong]. Expected behaviour: [what it should do]. Trigger condition: [when or how the bug manifests].",
+  "code_context":     "<copy the provided code snippet verbatim; append a trailing comment '# BUG: <short reason>' on each line that is part of the root cause — 25 lines max>",
+  "patch_constraints": {
+    "scope":           "<exact instruction for the Coder: 'Modify only <function>() in <file>. Do not refactor surrounding code.'>",
+    "preserve_tests":  [<keep the pre-built list; add any test file paths you identify that reference this function>],
+    "forbidden_files": [<keep the pre-built list; add any file paths the Coder must not touch>],
+    "style_hint":      "<language conventions in the file, e.g. 'snake_case, type hints present, PEP 8'>"
   },
-  "expected_behavior":  "<1-2 sentences describing what the function should do correctly after the patch>",
+  "expected_behavior": "<1-2 sentences: the exact return value, side effect, or state the function must produce after the fix>",
   "fallback_locations": [
-    {"file": "<path>", "function": "<name>", "reason": "<why this caller or callee might be the actual root cause>"}
+    {"file": "<path>", "function": "<name>", "reason": "<why this caller or callee might hold the actual root cause>"}
   ]
 }
-Do not omit any field. Use empty string "" or empty list [] as defaults when uncertain.
+Rules:
+- Do not omit any field. Use "" or [] as defaults when uncertain.
+- "line" must be an integer (not a string).
+- "confidence" must be a float (not a string).
+- All file paths must use forward slashes and be relative to the repo root.
 """
 
 _USER_TEMPLATE = """\
@@ -66,41 +82,47 @@ Description: {description}
 Severity:    {severity}
 Component:   {component}
 
-## Merge-Request Diff
-```
+## Merge-Request Diff  ← PRIMARY SIGNAL — focus on + and - lines first
+```diff
 {mr_diff}
 ```
 
-## Candidate Functions ({n_candidates} candidates)
+## Candidate Functions ({n_candidates} ranked by relevance — Candidate 1 is the strongest match)
 {candidates_block}
 
-## Code Context (lines around the suspected bug location)
+## Code Snippet (centred on the most likely bug line — copy this verbatim into "code_context" with # BUG: annotations)
 ```
 {code_context}
 ```
 
-## Patch Constraints (pre-built — validate and refine if needed)
+## Patch Constraints (pre-built — confirm or refine each sub-field)
 {patch_constraints_json}
 
-Identify the root cause and respond with the complete JSON schema described.
-All 13 fields are required. Use "" or [] for fields you cannot determine.
+---
+Return the complete JSON (all 13 fields). Use "" or [] for any field you cannot determine.
+Do not wrap the JSON in markdown fences or add any prose outside the JSON object.
 """
 
 _REFLEXION_TEMPLATE = """\
 Your previous analysis returned low confidence ({confidence:.2f}).
+The callers and callees of the candidate function are provided below for deeper inspection.
 
-Previous answer:
+## Previous answer
 {prev_json}
 
-## Expanded context — graph neighbours of the candidate
-
+## Expanded context — direct callers and callees of the candidate
 {expanded_block}
 
-Re-analyse with this additional context.
-Is the root cause in one of the neighbouring functions instead?
+## Re-analysis — answer these three questions before updating the JSON
+1. CALLER bug? Does a caller pass wrong arguments or call the function in an invalid state?
+2. CALLEE bug? Does the candidate rely on a helper that returns incorrect data?
+3. Same function? Is the root cause still in the original candidate, now confirmed with more context?
 
-Respond again with the COMPLETE JSON schema (all 13 fields) — no prose, no markdown fences.
-Preserve or improve all fields from the previous answer; update only what the new context changes.
+Update ONLY the fields that the expanded context changes.
+Raise "confidence" only if the new evidence genuinely resolves the ambiguity.
+Preserve all other fields from the previous answer unchanged.
+
+Respond with the COMPLETE JSON (all 13 fields) — no prose, no markdown fences.
 """
 
 
@@ -126,6 +148,7 @@ def _build_main_prompt(
     state: dict,
     code_ctx: str = "",
     patch_constraints: Optional[Dict] = None,
+    tool_search_results: Optional[List[dict]] = None,
 ) -> str:
     ticket   = state.get("ticket", {})
     mr_diff  = state.get("mr_diff", "")
@@ -150,6 +173,21 @@ def _build_main_prompt(
         code_context=code_ctx or "(no code context available)",
         patch_constraints_json=pc_json,
     )
+
+    # Append project structure summary if available (Phase 0 output).
+    project_structure = state.get("project_structure", {})
+    if project_structure:
+        from .phase0_workspace import _format_structure_for_prompt
+        struct_summary = _format_structure_for_prompt(project_structure, max_files=50)
+        user_msg += f"\n\n## Structure complète du projet\n{struct_summary}\n"
+
+    # Append tool_search_results section if available (Phase 3.5 output).
+    if tool_search_results:
+        lines = ["\n## Occurrences trouvées dans le repo"]
+        for r in tool_search_results[:5]:
+            lines.append(f"{r['file']}:{r['line']} → {r['content']}")
+        user_msg += "\n".join(lines) + "\n"
+
     return user_msg
 
 
@@ -423,19 +461,19 @@ def _validate_and_fill(result: dict, fallbacks: dict) -> dict:
     # problem_summary
     if not isinstance(result.get("problem_summary"), str) or not result["problem_summary"].strip():
         result["problem_summary"] = fallbacks.get("problem_summary", "")
-        print("[phase4] problem_summary missing — fallback applied.", file=sys.stderr)
+        logger.warning("[phase4] problem_summary missing — fallback applied.")
 
     # code_context
     if not isinstance(result.get("code_context"), str):
         result["code_context"] = fallbacks.get("code_context", "")
-        print("[phase4] code_context missing — fallback applied.", file=sys.stderr)
+        logger.warning("[phase4] code_context missing — fallback applied.")
 
     # patch_constraints — validate as a dict then sub-fields
     pc = result.get("patch_constraints")
     fb_pc = fallbacks.get("patch_constraints", {})
     if not isinstance(pc, dict):
         result["patch_constraints"] = fb_pc
-        print("[phase4] patch_constraints missing — fallback applied.", file=sys.stderr)
+        logger.warning("[phase4] patch_constraints missing — fallback applied.")
     else:
         if not isinstance(pc.get("scope"), str):
             pc["scope"] = fb_pc.get("scope", "")
@@ -449,13 +487,13 @@ def _validate_and_fill(result: dict, fallbacks: dict) -> dict:
     # expected_behavior
     if not isinstance(result.get("expected_behavior"), str) or not result["expected_behavior"].strip():
         result["expected_behavior"] = fallbacks.get("expected_behavior", "")
-        print("[phase4] expected_behavior missing — fallback applied.", file=sys.stderr)
+        logger.warning("[phase4] expected_behavior missing — fallback applied.")
 
     # fallback_locations — must be a list of dicts with at least file + function
     fl = result.get("fallback_locations")
     if not isinstance(fl, list):
         result["fallback_locations"] = []
-        print("[phase4] fallback_locations missing — reset to [].", file=sys.stderr)
+        logger.warning("[phase4] fallback_locations missing — reset to [].")
     else:
         valid: List[dict] = []
         for item in fl:
@@ -482,11 +520,13 @@ def phase_llm_confirm(state: dict) -> dict:
         problem_summary, code_context, patch_constraints,
         expected_behavior, fallback_locations
     """
-    contexts:      List[dict] = state.get("rag_contexts", [])
-    all_functions: List[dict] = state.get("all_functions", [])
-    graph_data:    dict       = state.get("repo_graph", {})
-    model:         str        = state.get("llm_model", DEFAULT_MODEL)
-    ticket:        dict       = state.get("ticket", {})
+    contexts:             List[dict] = state.get("rag_contexts", [])
+    all_functions:        List[dict] = state.get("all_functions", [])
+    ast_functions:        List[dict] = state.get("ast_functions", [])
+    tool_search_results:  List[dict] = state.get("tool_search_results", [])
+    graph_data:           dict       = state.get("repo_graph", {})
+    model:                str        = state.get("llm_model", DEFAULT_MODEL)
+    ticket:               dict       = state.get("ticket", {})
 
     _empty_constraints: Dict = {
         "scope": "", "preserve_tests": [], "forbidden_files": [], "style_hint": ""
@@ -507,10 +547,21 @@ def phase_llm_confirm(state: dict) -> dict:
 
     # ── Pre-LLM: build deterministic context from top RAG candidate ───────────
     top_candidate = contexts[0]
-    raw_code_ctx  = extract_code_context(
+
+    # Prefer source_real (Phase 3.5) over re-reading the file — better quality
+    # as it includes real line numbers and the ±5-line context window.
+    _top_ast_fn = next(
+        (fn for fn in ast_functions
+         if fn.get("function") == top_candidate.get("function")
+         and fn.get("file") == top_candidate.get("file")),
+        None,
+    )
+    _top_source_real = (_top_ast_fn or {}).get("source_real", "")
+    raw_code_ctx = _top_source_real or extract_code_context(
         top_candidate.get("file", ""),
         top_candidate.get("start_line", 0),
     )
+
     patch_constraints_prebuilt = build_patch_constraints(
         state,
         {
@@ -521,12 +572,14 @@ def phase_llm_confirm(state: dict) -> dict:
     )
 
     # ── Call 1: main localisation ──────────────────────────────────────────────
-    user_prompt = _build_main_prompt(state, raw_code_ctx, patch_constraints_prebuilt)
+    user_prompt = _build_main_prompt(
+        state, raw_code_ctx, patch_constraints_prebuilt, tool_search_results
+    )
     try:
         raw    = _call_ollama(user_prompt, model=model)
         result = _parse_llm_json(raw)
     except Exception as exc:
-        print(f"[phase4] LLM call failed: {exc}", file=sys.stderr)
+        logger.error("[phase4] LLM call failed: %s", exc)
         result = None
 
     if result is None:
@@ -544,9 +597,9 @@ def phase_llm_confirm(state: dict) -> dict:
 
     # ── Reflexion: call 2 if confidence < threshold ────────────────────────────
     if confidence < REFLEXION_THRESHOLD and all_functions and graph_data:
-        print(
-            f"[phase4] Confidence {confidence:.2f} < {REFLEXION_THRESHOLD} — running Reflexion.",
-            file=sys.stderr,
+        logger.info(
+            "[phase4] Confidence %.2f < %.2f — running Reflexion.",
+            confidence, REFLEXION_THRESHOLD,
         )
         expanded = _expand_graph_neighbours(
             candidate_function=result.get("function", ""),
@@ -564,7 +617,7 @@ def phase_llm_confirm(state: dict) -> dict:
                     result     = result2
                     confidence = float(result.get("confidence", 0.0))
             except Exception as exc:
-                print(f"[phase4] Reflexion LLM call failed: {exc}", file=sys.stderr)
+                logger.error("[phase4] Reflexion LLM call failed: %s", exc)
 
     # ── Enrich with callers / callees / language from phase-2 data ────────────
     matched_fn = next(
@@ -589,8 +642,17 @@ def phase_llm_confirm(state: dict) -> dict:
 
     # ── Post-LLM: re-build deterministic fields for the actual location ────────
     # The LLM may have selected a different file/line than the top RAG candidate.
+    # Prefer source_real from ast_functions (Phase 3.5) for the LLM-identified fn.
+    _llm_ast_fn = next(
+        (fn for fn in ast_functions
+         if fn.get("function") == result.get("function")
+         and fn.get("file") == result.get("file")),
+        None,
+    )
+    _llm_source_real = (_llm_ast_fn or {}).get("source_real", "")
     actual_code_ctx = (
-        extract_code_context(result.get("file", ""), result.get("line", 0))
+        _llm_source_real
+        or extract_code_context(result.get("file", ""), result.get("line", 0))
         or raw_code_ctx
     )
     actual_constraints = build_patch_constraints(
@@ -617,11 +679,3 @@ def phase_llm_confirm(state: dict) -> dict:
     result = _validate_and_fill(result, llm_fallbacks)
 
     return {**state, "location": result, "confidence": confidence}
-
-def normalize_path(file_path: str, repo_path: str) -> str:
-    abs_path = os.path.abspath(os.path.join(repo_path, file_path))
-    rel = os.path.relpath(abs_path, repo_path).replace("\\", "/")
-    # Garde le chemin original si la normalisation produit des ../
-    if rel.startswith(".."):
-        return file_path.replace("\\", "/")
-    return rel

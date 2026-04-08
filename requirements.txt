@@ -6,40 +6,46 @@ langchain-core>=0.2.0
 rank-bm25>=0.2.2
 
 # ── Phase 2 — AST parsing + call graph + diff signal ─────────────────────────
+# Core tree-sitter binding
 tree-sitter>=0.22
+
+# Language grammars used by phase2_treesitter._LANG_MODULE
 tree-sitter-python>=0.23
 tree-sitter-javascript>=0.23
 tree-sitter-typescript>=0.23
 tree-sitter-java>=0.23
 tree-sitter-go>=0.23
+tree-sitter-rust>=0.23
+tree-sitter-cpp>=0.23
+tree-sitter-c>=0.23
+tree-sitter-c-sharp>=0.23
+tree-sitter-ruby>=0.23
+tree-sitter-kotlin>=0.3
+tree-sitter-swift>=0.5
+
+# Graph algorithms (PageRank, call graph)
 networkx>=3.3
 
 # ── Phase 3 — RAG + vector store ─────────────────────────────────────────────
 sentence-transformers>=3.0.0
 chromadb>=0.5.0
-torch>=2.3.0
+# torch + transformers are pulled in by sentence-transformers;
+# pin them explicitly to avoid silent downgrades.
+#torch>=2.3.0
 transformers>=4.40.0
 accelerate>=0.30.0
 
 # ── Phase 4 — LLM local via Ollama ───────────────────────────────────────────
 ollama>=0.3.0
 
-# ── Modification 1 — Embedding indexer ───────────────────────────────────────
-# sentence-transformers + chromadb déjà listés ci-dessus
-# Modèle recommandé : nomic-embed-text v1.5 (via sentence-transformers)
-# Fallback léger   : all-MiniLM-L6-v2 (déjà téléchargé dans ton venv)
-
-# ── Modification 2 — Diff signal extractor ───────────────────────────────────
-# Pas de dépendance nouvelle — stdlib uniquement (re, pathlib)
-
-# ── Modification 3 — Structured output + validation ──────────────────────────
+# ── Structured output + validation ───────────────────────────────────────────
 pydantic>=2.7.0
 
-# ── Checkpointing ────────────────────────────────────────────────────────────
+# ── Checkpointing (PostgresSaver) ─────────────────────────────────────────────
 psycopg[binary]>=3.1.0
 langgraph-checkpoint-postgres>=1.0.4
 
-# ── GitLab integration + API ─────────────────────────────────────────────────
+# ── GitLab integration + REST API ─────────────────────────────────────────────
 python-gitlab>=4.9.0
 fastapi>=0.111.0
 uvicorn>=0.30.0

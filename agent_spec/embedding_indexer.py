@@ -19,6 +19,8 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+from .constants import SKIP_DIRS, SUPPORTED_EXTENSIONS
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 CHUNK_SIZE    = 50   # lines per chunk
@@ -28,20 +30,6 @@ UPSERT_BATCH  = 512  # max chunks per Chroma add() call
 
 MODEL_ID    = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 CHROMA_PATH = os.environ.get("CHROMA_PERSIST_PATH", "/tmp/chroma")
-
-SUPPORTED_EXTENSIONS = {
-    ".py", ".js", ".ts", ".jsx", ".tsx",
-    ".java", ".go", ".rs",
-    ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
-    ".cs", ".rb", ".php", ".kt", ".swift",
-}
-
-SKIP_DIRS = {
-    ".git", "node_modules", "__pycache__", "vendor",
-    ".venv", "venv", "env",
-    "dist", "build", "target", "out",
-    ".idea", ".vscode", ".mypy_cache", ".pytest_cache",
-}
 
 # ── Singleton embedding model ──────────────────────────────────────────────────
 

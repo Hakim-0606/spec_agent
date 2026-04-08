@@ -24,25 +24,12 @@ from typing import Dict, List, Tuple
 
 from rank_bm25 import BM25Okapi
 
+from .constants import SKIP_DIRS, SUPPORTED_EXTENSIONS
 from .embedding_indexer import get_indexer
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-
-SUPPORTED_EXTENSIONS = {
-    ".py", ".js", ".ts", ".jsx", ".tsx",
-    ".java", ".go", ".rs",
-    ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
-    ".cs", ".rb", ".php", ".kt", ".swift",
-}
-
-SKIP_DIRS = {
-    ".git", "node_modules", "__pycache__", "vendor",
-    ".venv", "venv", "env",
-    "dist", "build", "target", "out",
-    ".idea", ".vscode", ".mypy_cache", ".pytest_cache",
-}
 
 # Nombre maximum de fichiers passes au BM25 (protection RAM sur grands repos).
 MAX_FILES = 5000
@@ -281,6 +268,30 @@ def _rrf_fusion(
     ]
 
 
+# ── Phase 0 file list reuse ────────────────────────────────────────────────────
+
+
+def _files_from_structure(struct_files: list, repo_path: str) -> Tuple[List[str], List[str]]:
+    """
+    Construit (absolute_paths, contents) depuis la liste de Phase 0.
+    Evite le double rglob quand project_structure est disponible.
+    """
+    files: List[str] = []
+    contents: List[str] = []
+    for entry in struct_files:
+        rel = entry.get("path", "")
+        if not rel:
+            continue
+        abs_path = os.path.join(repo_path, rel.replace("/", os.sep))
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                contents.append(fh.read())
+            files.append(abs_path)
+        except (IOError, OSError):
+            pass
+    return files, contents
+
+
 # ── LangGraph node ─────────────────────────────────────────────────────────────
 
 
@@ -288,15 +299,24 @@ def phase_bm25(state: dict) -> dict:
     """
     LangGraph node — Phase 1.
 
-    Reads:  ticket, mr_diff, repo_path
+    Reads:  ticket, mr_diff, repo_path, project_structure (Phase 0, optionnel)
     Writes: keywords, bm25_files, rrf_scores
+
+    Optimisation : si project_structure["files"] existe (Phase 0 a tourné),
+    la liste de fichiers est réutilisée sans re-scanner le repo.
     """
     ticket    = state["ticket"]
     mr_diff   = state["mr_diff"]
     repo_path = state["repo_path"]
 
-    component = ticket.get("component", "")
-    files, contents = collect_repo_files(repo_path, component=component)
+    # Réutiliser la liste de Phase 0 si disponible (évite le double scan rglob).
+    struct_files = state.get("project_structure", {}).get("files", [])
+    if struct_files:
+        logger.info("[phase1] Réutilisation de %d fichiers depuis Phase 0 (skip rglob).", len(struct_files))
+        files, contents = _files_from_structure(struct_files, repo_path)
+    else:
+        component = ticket.get("component", "")
+        files, contents = collect_repo_files(repo_path, component=component)
 
     if not files:
         return {**state, "keywords": [], "bm25_files": [], "rrf_scores": []}

@@ -5,7 +5,7 @@ Wires the four phases into a linear pipeline with PostgreSQL checkpointing
 for crash-resumable execution.
 
 Topology:
-    bm25 → treesitter → rag → llm → END
+    workspace → bm25 → treesitter → rag → tools → llm → END
 
 Checkpointing:
     - If POSTGRES_URI env var is set: PostgresSaver (persistent, resumable)
@@ -18,9 +18,11 @@ from typing import Any, Optional
 from langgraph.graph import StateGraph, END
 
 from .state import SpecState
+from .phase0_workspace import phase_workspace
 from .phase1_bm25 import phase_bm25
 from .phase2_treesitter import phase_treesitter
 from .phase3_rag import phase_rag
+from .phase35_tools import phase_tools
 from .phase4_llm import phase_llm_confirm
 
 
@@ -69,15 +71,19 @@ def build_graph():
     """Build and compile the Agent Spec StateGraph."""
     builder = StateGraph(SpecState)
 
+    builder.add_node("workspace", phase_workspace)
     builder.add_node("bm25", phase_bm25)
     builder.add_node("treesitter", phase_treesitter)
     builder.add_node("rag", phase_rag)
+    builder.add_node("tools", phase_tools)
     builder.add_node("llm", phase_llm_confirm)
 
-    builder.set_entry_point("bm25")
+    builder.set_entry_point("workspace")
+    builder.add_edge("workspace", "bm25")
     builder.add_edge("bm25", "treesitter")
     builder.add_edge("treesitter", "rag")
-    builder.add_edge("rag", "llm")
+    builder.add_edge("rag", "tools")
+    builder.add_edge("tools", "llm")
     builder.add_edge("llm", END)
 
     checkpointer = _make_checkpointer()
@@ -109,7 +115,10 @@ def run_agent_spec(
     Returns:
         {
             "file", "function", "line", "root_cause",
-            "confidence", "callers", "callees"
+            "confidence", "callers", "callees", "language",
+            "problem_summary", "code_context",
+            "patch_constraints", "expected_behavior",
+            "fallback_locations"
         }
     """
     global _graph
@@ -127,11 +136,12 @@ def run_agent_spec(
         "ast_functions": [],
         "all_functions": [],
         "rag_contexts": [],
+        "project_structure":   {},
+        "tool_search_results": [],
         "location": {},
         "confidence": 0.0,
         "rrf_scores": [],
-        # Optional overrides.
-        **({"llm_model": llm_model} if llm_model else {}),
+        "llm_model": llm_model or "",
     }
 
     config = {"configurable": {"thread_id": thread_id or ticket.get("id", "default")}}
