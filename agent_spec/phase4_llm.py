@@ -12,10 +12,13 @@ Budget: max 2 LLM calls per execution.
 """
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 import networkx as nx
 
@@ -221,7 +224,7 @@ def _call_ollama(user_prompt: str, model: str = DEFAULT_MODEL) -> str:
         format="json",
         options={"temperature": 0.1},   # low temperature for deterministic output
     )
-    return response["message"]["content"]
+    return response.message.content
 
 
 # ── JSON parser ────────────────────────────────────────────────────────────────
@@ -242,8 +245,8 @@ def _parse_llm_json(raw: str) -> Optional[Dict]:
     except json.JSONDecodeError:
         pass
 
-    # 2. Extract first JSON object from text.
-    match = re.search(r"\{[^{}]+\}", raw, re.DOTALL)
+    # 2. Extract first complete JSON object from text (handles nested braces).
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
     if match:
         try:
             data = json.loads(match.group())
