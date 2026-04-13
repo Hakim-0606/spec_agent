@@ -12,10 +12,13 @@ Checkpointing:
     - Otherwise: MemorySaver (in-process, for local dev / testing)
 """
 
+import logging
 import os
 from typing import Any, Optional
 
 from langgraph.graph import StateGraph, END
+
+logger = logging.getLogger(__name__)
 
 from .state import SpecState
 from .phase0_workspace import phase_workspace
@@ -46,21 +49,20 @@ def _make_checkpointer():
             conn = psycopg.connect(postgres_uri, autocommit=True)
             saver = PostgresSaver(conn)
             saver.setup()  # Creates the checkpointing tables if they don't exist.
-            print(f"[graph] Using PostgreSQL checkpointer at {postgres_uri[:30]}…")
+            logger.info("[graph] Using PostgreSQL checkpointer at %s…", postgres_uri[:30])
             return saver
         except ImportError:
-            print(
+            logger.warning(
                 "[graph] langgraph-checkpoint-postgres not installed. "
                 "Falling back to MemorySaver."
             )
         except Exception as exc:
-            print(
-                f"[graph] Cannot connect to PostgreSQL ({exc}). "
-                "Falling back to MemorySaver."
+            logger.warning(
+                "[graph] Cannot connect to PostgreSQL (%s). Falling back to MemorySaver.", exc
             )
 
     from langgraph.checkpoint.memory import MemorySaver
-    print("[graph] Using in-memory checkpointer (set POSTGRES_URI for persistence).")
+    logger.info("[graph] Using in-memory checkpointer (set POSTGRES_URI for persistence).")
     return MemorySaver()
 
 
@@ -101,16 +103,31 @@ def run_agent_spec(
     repo_path: str,
     thread_id: Optional[str] = None,
     llm_model: Optional[str] = None,
+    # ── Optional extra context from the orchestrator ───────────────────────────
+    error_trace:    Optional[str]  = None,   # full stack trace
+    affected_files: Optional[list] = None,   # files already identified
+    commit_sha:     Optional[str]  = None,   # commit that introduced the bug
+    retry_feedback: Optional[str]  = None,   # Coder feedback on a failed fix
+    priority_hints: Optional[list] = None,   # areas to focus on
+    related_issues: Optional[list] = None,   # related issue/MR IDs
+    **extra,                                 # any other field the orchestrator sends
 ) -> dict:
     """
     Run the Agent Spec pipeline and return the bug location dict.
 
     Args:
-        ticket    : Structured GitLab ticket dict.
-        mr_diff   : Unified diff string from the MR.
-        repo_path : Absolute path to the locally cloned repository.
-        thread_id : Checkpoint thread ID.  Use the ticket ID for resumability.
-        llm_model : Ollama model name (default: $OLLAMA_MODEL or 'llama3.2').
+        ticket         : Structured GitLab ticket dict.
+        mr_diff        : Unified diff string from the MR.
+        repo_path      : Absolute path to the locally cloned repository.
+        thread_id      : Checkpoint thread ID.  Use the ticket ID for resumability.
+        llm_model      : Ollama model name (default: $OLLAMA_MODEL or 'llama3.2').
+        error_trace    : Full stack trace from the bug (strongly improves Phase 4).
+        affected_files : Files already identified by the orchestrator.
+        commit_sha     : Git commit SHA that introduced or exposed the bug.
+        retry_feedback : Feedback from the Coder if a previous fix attempt failed.
+        priority_hints : Specific areas / modules to focus on.
+        related_issues : IDs of related GitLab issues or MRs.
+        **extra        : Any additional fields sent by the orchestrator.
 
     Returns:
         {
@@ -118,17 +135,33 @@ def run_agent_spec(
             "confidence", "callers", "callees", "language",
             "problem_summary", "code_context",
             "patch_constraints", "expected_behavior",
-            "fallback_locations"
+            "missing_files", "fallback_locations"
         }
     """
     global _graph
     if _graph is None:
         _graph = build_graph()
 
+    # Collect all optional orchestrator fields into extra_context (skip None).
+    extra_context: dict = {
+        k: v for k, v in {
+            "error_trace":    error_trace,
+            "affected_files": affected_files,
+            "commit_sha":     commit_sha,
+            "retry_feedback": retry_feedback,
+            "priority_hints": priority_hints,
+            "related_issues": related_issues,
+            **extra,
+        }.items() if v is not None
+    }
+    if extra_context:
+        logger.info("[graph] extra_context received: %s", list(extra_context.keys()))
+
     initial_state: SpecState = {
         "ticket": ticket,
         "mr_diff": mr_diff,
         "repo_path": repo_path,
+        "extra_context": extra_context,
         # Phase outputs — initialised empty.
         "keywords": [],
         "bm25_files": [],

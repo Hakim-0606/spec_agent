@@ -232,7 +232,7 @@ class DiffSignalExtractor:
                         break
 
             # ── Signal 3: function file matches the ticket component ───────────
-            if signal < BOOST_MODIFIED_FILE and component:
+            if signal < BOOST_COMPONENT_MATCH and component:
                 norm = _normalise_file_path(fpath)
                 comp = component.rstrip("/")
                 if norm.startswith(comp) or comp in norm:

@@ -9,8 +9,11 @@ contexts for the Phase-4 LLM.
 No LLM.  GPU optional (CPU fallback available).
 """
 
+import logging
 import re
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 # Lazy-loaded heavy dependencies so import errors are isolated.
 _embedding_model = None
@@ -22,14 +25,20 @@ _MODEL_ID = _os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM
 
 
 def _get_embedding_model():
-    """Load the embedding model once (lazy singleton)."""
+    """Load the embedding model once (lazy singleton).
+
+    Uses transformers direct loading for codet5p (sentence-transformers incompatible),
+    SentenceTransformer for everything else.
+    """
     global _embedding_model
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-        kwargs = {}
         if "codet5p" in _MODEL_ID.lower():
-            kwargs["trust_remote_code"] = True
-        _embedding_model = SentenceTransformer(_MODEL_ID, **kwargs)
+            # Import the shared encoder from embedding_indexer to avoid duplication.
+            from .embedding_indexer import _CodeT5pEncoder
+            _embedding_model = _CodeT5pEncoder(_MODEL_ID)
+        else:
+            from sentence_transformers import SentenceTransformer
+            _embedding_model = SentenceTransformer(_MODEL_ID)
     return _embedding_model
 
 
@@ -148,8 +157,7 @@ def _semantic_rerank(
 
     except Exception as exc:
         # Graceful fallback: return top-k by existing score if embeddings fail.
-        import sys
-        print(f"[phase3] Embedding/Chroma unavailable ({exc}), using score fallback.", file=sys.stderr)
+        logger.warning("[phase3] Embedding/Chroma unavailable (%s) — using score fallback.", exc)
         sorted_fns = sorted(functions, key=lambda f: f.get("score", 0.0), reverse=True)
         for fn in sorted_fns:
             fn.setdefault("semantic_score", fn.get("score", 0.0))

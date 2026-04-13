@@ -411,9 +411,66 @@ def phase_treesitter(state: dict) -> dict:
     mr_diff:    str        = state.get("mr_diff", "")
     ticket:     dict       = state.get("ticket", {})
 
+    logger.info("[phase2] Parsing %d BM25 files with tree-sitter…", len(bm25_files))
+
     all_functions: List[Dict] = []
+    skipped = 0
     for entry in bm25_files:
-        all_functions.extend(parse_file(entry["file"]))
+        parsed = parse_file(entry["file"])
+        if parsed:
+            all_functions.extend(parsed)
+        else:
+            skipped += 1
+
+    # For files with no parseable functions (module-level code like urlpatterns,
+    # settings, constants), create a synthetic "_module_" entry so they still
+    # reach Phase 3 RAG and can be identified by the LLM.
+    parsed_files = {fn.get("file") for fn in all_functions}
+    synthetic_added = 0
+    for entry in bm25_files:
+        fpath = entry.get("file", "")
+        if not fpath or fpath in parsed_files:
+            continue
+        ext  = Path(fpath).suffix.lower()
+        lang = EXT_TO_LANG.get(ext, "")
+        if not lang:
+            continue
+        try:
+            content = Path(fpath).read_text(encoding="utf-8", errors="replace")
+            lines   = content.splitlines()
+            all_functions.append({
+                "file":       fpath,
+                "function":   "_module_level_",
+                "class":      None,
+                "start_line": 1,
+                "end_line":   len(lines),
+                "source":     "\n".join(lines[:80]),  # first 80 lines
+                "signature":  f"# module: {Path(fpath).name}",
+                "callers":    [],
+                "callees":    [],
+                "raw_callees": set(),
+                "language":   lang,
+                "score":      0.0,
+                "diff_boost": 1.0,
+                "final_score": 0.0,
+            })
+            synthetic_added += 1
+        except Exception:
+            pass
+
+    if synthetic_added:
+        logger.info("[phase2] Added %d synthetic module-level entries for files with no functions.", synthetic_added)
+
+    langs_found = sorted({fn.get("language", "?") for fn in all_functions})
+    logger.info(
+        "[phase2] Extracted %d functions from %d files (skipped %d, synthetic %d) | languages: %s",
+        len(all_functions) - synthetic_added, len(bm25_files) - skipped, skipped, synthetic_added,
+        ", ".join(langs_found) or "none",
+    )
+
+    if not all_functions:
+        logger.warning("[phase2] No functions extracted — Phase 2 degraded (tree-sitter parse failed?).")
+        return {**state, "repo_graph": {}, "ast_functions": [], "all_functions": []}
 
     G = build_call_graph(all_functions)
 
@@ -424,6 +481,14 @@ def phase_treesitter(state: dict) -> dict:
 
     # Apply MR diff boosts and re-rank → final top-5.
     top5 = _apply_diff_boosts(all_scored, mr_diff, ticket, top_k=5)
+
+    logger.info(
+        "[phase2] Top-5 candidates: %s",
+        ", ".join(
+            "%s::%s (score=%.3f)" % (fn.get("file", "?"), fn.get("function", "?"), fn.get("final_score", 0))
+            for fn in top5
+        ) or "none",
+    )
 
     # Serialise raw_callees (set → list) for JSON checkpointing.
     for fn in all_functions:

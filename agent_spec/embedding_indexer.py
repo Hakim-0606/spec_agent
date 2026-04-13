@@ -28,22 +28,78 @@ CHUNK_OVERLAP = 10   # overlap between consecutive chunks
 EMBED_BATCH   = 32   # sentences per encode() call
 UPSERT_BATCH  = 512  # max chunks per Chroma add() call
 
-MODEL_ID    = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-CHROMA_PATH = os.environ.get("CHROMA_PERSIST_PATH", "/tmp/chroma")
+MODEL_ID    = os.environ.get("EMBEDDING_MODEL", "Salesforce/codet5p-110m-embedding")
+CHROMA_PATH = os.environ.get(
+    "CHROMA_PERSIST_PATH",
+    str(Path.home() / ".cache" / "spec_agent" / "chroma"),
+)
 
 # ── Singleton embedding model ──────────────────────────────────────────────────
 
 _embedding_model = None
 
 
+class _CodeT5pEncoder:
+    """
+    Thin wrapper around Salesforce/codet5p-110m-embedding loaded via transformers.
+    Exposes the same .encode(texts, batch_size, show_progress_bar) interface as
+    SentenceTransformer so the rest of the code is unchanged.
+    codet5p cannot be loaded through sentence-transformers because its custom config
+    conflicts with the SentenceTransformer wrapper (missing 'is_decoder' attribute).
+    """
+
+    def __init__(self, model_id: str):
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+        logger.info(f"[EmbeddingIndexer] Loading codet5p via transformers: '{model_id}'…")
+        self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        self._model     = AutoModel.from_pretrained(model_id, trust_remote_code=True)
+        self._model.eval()
+        self._torch = torch
+        logger.info("[EmbeddingIndexer] codet5p model ready.")
+
+    def encode(
+        self,
+        sentences,
+        batch_size: int = 32,
+        show_progress_bar: bool = False,
+        **_,
+    ):
+        import numpy as np
+        torch = self._torch
+        all_embeddings = []
+        for i in range(0, len(sentences), batch_size):
+            batch = sentences[i : i + batch_size]
+            inputs = self._tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            )
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+            # codet5p returns the embedding at position 0 (pooled representation)
+            embeddings = outputs.last_hidden_state[:, 0, :]
+            all_embeddings.append(embeddings.cpu().numpy())
+        return np.vstack(all_embeddings)
+
+
 def _get_model():
-    """Load the sentence-transformers model once (module-level singleton)."""
+    """Load the embedding model once (module-level singleton).
+
+    Uses _CodeT5pEncoder for Salesforce/codet5p-110m-embedding (transformers direct),
+    and SentenceTransformer for all other models.
+    """
     global _embedding_model
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
         logger.info(f"[EmbeddingIndexer] Loading model '{MODEL_ID}'…")
-        _embedding_model = SentenceTransformer(MODEL_ID)
-        logger.info("[EmbeddingIndexer] Model ready.")
+        if "codet5p" in MODEL_ID.lower():
+            _embedding_model = _CodeT5pEncoder(MODEL_ID)
+        else:
+            from sentence_transformers import SentenceTransformer
+            _embedding_model = SentenceTransformer(MODEL_ID)
+            logger.info("[EmbeddingIndexer] Model ready.")
     return _embedding_model
 
 

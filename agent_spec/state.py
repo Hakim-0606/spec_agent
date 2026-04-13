@@ -10,6 +10,19 @@ class SpecState(TypedDict):
     # ── LLM override ──────────────────────────────────────────────────────────
     llm_model: str   # Ollama model name — optionnel, défaut via $OLLAMA_MODEL
 
+    # ── Extra context from orchestrator (all optional) ─────────────────────────
+    # Any additional fields sent by the orchestrator that can help the agent.
+    # Injected verbatim into the Phase 4 LLM prompt.
+    extra_context: dict  # {
+    #   "error_trace":       str   — full stack trace from the bug
+    #   "affected_files":    list  — files already identified by the orchestrator
+    #   "commit_sha":        str   — commit that introduced the bug
+    #   "retry_feedback":    str   — Coder feedback if a previous fix failed
+    #   "priority_hints":    list  — specific areas to focus on
+    #   "related_issues":    list  — IDs of related issues/MRs
+    #   ... any other field sent by the orchestrator
+    # }
+
     # ── Phase 0 — Workspace & Project Structure ───────────────────────────────
     # Carte structurelle complète du projet extraite avant BM25.
     # {repo_path, project_name, summary:{total_files,functions,classes,languages},

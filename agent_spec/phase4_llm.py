@@ -43,6 +43,19 @@ Your output is consumed directly by an Agent Coder that will write the fix — p
 2. Read that candidate's source. Find the exact line(s) where the logic is wrong.
 3. Check callers and callees: could the bug be one level up (bad input) or down (broken helper)?
 4. Assign confidence using the calibration scale below.
+5. MISSING FILE CHECK — if the error is ImportError / ModuleNotFoundError / missing module:
+   a. Identify the EXISTING file that contains the bad import or reference (this goes in "file").
+   b. Identify the EXACT line of the bad import/include call (this goes in "line").
+   c. List every file that must be CREATED to fix the error in "missing_files".
+   d. For each missing file, provide a "template" with the minimal valid content the Coder must write.
+   Rule: "file" must ALWAYS point to an EXISTING file in the repo — never to the missing file.
+
+   CONCRETE EXAMPLE (ModuleNotFoundError: No module named 'apps.services.urls'):
+   WRONG → file = "apps/services/urls.py"   ← this file does NOT EXIST, never put it in "file"
+   RIGHT → file = "fiber_crm/urls.py"        ← this EXISTING file has: include('apps.services.urls')
+           line = <line number of include(...)>
+           missing_files = [{"path": "apps/services/urls.py", "template": "..."}]
+   If the caller file appears in your fallback_locations, that is your "file" — move it there.
 
 ## Confidence calibration
 0.90 – 1.00 : Buggy line visible in both the diff and the function source.
@@ -52,29 +65,41 @@ Below 0.50  : Evidence weak — reflexion will trigger a second analysis automat
 
 ## Output — respond ONLY with valid JSON, no prose, no markdown fences
 {
-  "file":             "<relative path from repo root — forward slashes>",
-  "function":         "<exact function or method name as it appears in the source>",
-  "line":             <integer: 1-based line number of the root cause; 0 if unknown>,
-  "root_cause":       "<one precise sentence stating WHAT is wrong and WHY — e.g. 'Off-by-one in slice index silently drops the last element when the list is non-empty'>",
+  "file":             "<relative path of the EXISTING file that contains the root cause — forward slashes>",
+  "function":         "<exact function or method name as it appears in the source — must exist in 'file'>",
+  "line":             <integer: 1-based line number of the root cause inside 'file'; 0 if unknown>,
+  "root_cause":       "<one precise sentence: WHAT is wrong, WHERE it is, and WHY it breaks — e.g. 'include(apps.services.urls) in fiber_crm/urls.py references a module that does not exist'>",
   "confidence":       <float 0.0–1.0 calibrated to the scale above>,
   "problem_summary":  "Observed behaviour: [what the system currently does wrong]. Expected behaviour: [what it should do]. Trigger condition: [when or how the bug manifests].",
-  "code_context":     "<copy the provided code snippet verbatim; append a trailing comment '# BUG: <short reason>' on each line that is part of the root cause — 25 lines max>",
+  "code_context":     "<copy the exact lines around the bug from 'file'; append '# BUG: <short reason>' on each buggy line — 25 lines max>",
   "patch_constraints": {
-    "scope":           "<exact instruction for the Coder: 'Modify only <function>() in <file>. Do not refactor surrounding code.'>",
-    "preserve_tests":  [<keep the pre-built list; add any test file paths you identify that reference this function>],
-    "forbidden_files": [<keep the pre-built list; add any file paths the Coder must not touch>],
-    "style_hint":      "<language conventions in the file, e.g. 'snake_case, type hints present, PEP 8'>"
+    "scope":           "<exact instruction: 'In <file>, fix line <N> — <what to change>. If missing_files is non-empty, create each listed file with the provided template.'>",
+    "preserve_tests":  [<test file paths that reference the buggy function — keep pre-built list and add any you identify>],
+    "forbidden_files": [<files the Coder must NOT touch — keep pre-built list>],
+    "style_hint":      "<naming convention + type hints + formatting rules observed in 'file'>"
   },
-  "expected_behavior": "<1-2 sentences: the exact return value, side effect, or state the function must produce after the fix>",
+  "expected_behavior": "<1-2 sentences: exact state the system must reach after the fix — e.g. 'The dev server starts without ImportError; all existing URL routes remain functional'>",
+  "missing_files": [
+    {
+      "path":     "<relative path of the file to CREATE — forward slashes>",
+      "reason":   "<why this file must be created — e.g. referenced by include() but absent from repo>",
+      "template": "<minimal valid content the Coder must write verbatim — include all required imports, class/function stubs, and urlpatterns if applicable>"
+    }
+  ],
   "fallback_locations": [
-    {"file": "<path>", "function": "<name>", "reason": "<why this caller or callee might hold the actual root cause>"}
+    {"file": "<path>", "function": "<name>", "reason": "<why this caller or callee might also hold a root cause>"}
   ]
 }
 Rules:
 - Do not omit any field. Use "" or [] as defaults when uncertain.
 - "line" must be an integer (not a string).
 - "confidence" must be a float (not a string).
+- "file" must be an EXISTING file — never set it to a file listed in "missing_files".
+- SELF-CHECK before output: if "file" == any path in missing_files[].path, you violated the rule — fix it.
 - All file paths must use forward slashes and be relative to the repo root.
+- "missing_files" must be [] when no file needs to be created.
+- "template" in missing_files must be complete enough for the Coder to write the file without guessing.
+- "patch_constraints.scope" must reference the "file" value, NOT a file in missing_files.
 """
 
 _USER_TEMPLATE = """\
@@ -189,6 +214,46 @@ def _build_main_prompt(
         lines = ["\n## Occurrences trouvées dans le repo"]
         for r in tool_search_results[:5]:
             lines.append(f"{r['file']}:{r['line']} → {r['content']}")
+        user_msg += "\n".join(lines) + "\n"
+
+    # Append extra_context from the orchestrator (high-value signals).
+    extra_context: dict = state.get("extra_context") or {}
+    if extra_context:
+        lines = ["\n## Additional Context from Orchestrator"]
+
+        if extra_context.get("error_trace"):
+            lines.append(f"\n### Stack Trace  ← USE THIS to pinpoint the exact crash line")
+            lines.append("```")
+            lines.append(extra_context["error_trace"][:2000])
+            lines.append("```")
+
+        if extra_context.get("affected_files"):
+            lines.append(f"\n### Affected Files (pre-identified)")
+            for f in extra_context["affected_files"][:10]:
+                lines.append(f"  - {f}")
+
+        if extra_context.get("commit_sha"):
+            lines.append(f"\n### Commit that introduced the bug: {extra_context['commit_sha']}")
+
+        if extra_context.get("retry_feedback"):
+            lines.append(f"\n### Coder Feedback (previous fix failed)  ← IMPORTANT: adjust your analysis")
+            lines.append(extra_context["retry_feedback"][:500])
+
+        if extra_context.get("priority_hints"):
+            lines.append(f"\n### Priority Areas")
+            for h in extra_context["priority_hints"][:5]:
+                lines.append(f"  - {h}")
+
+        if extra_context.get("related_issues"):
+            lines.append(f"\n### Related Issues/MRs: {', '.join(str(x) for x in extra_context['related_issues'])}")
+
+        # Any other unknown fields — append as-is.
+        known = {"error_trace", "affected_files", "commit_sha", "retry_feedback", "priority_hints", "related_issues"}
+        for k, v in extra_context.items():
+            if k not in known:
+                lines.append(f"\n### {k}")
+                lines.append(str(v)[:300])
+
         user_msg += "\n".join(lines) + "\n"
 
     return user_msg
@@ -458,7 +523,7 @@ def build_patch_constraints(state: dict, location: dict) -> Dict:
 
 def _validate_and_fill(result: dict, fallbacks: dict) -> dict:
     """
-    Validate the 5 new fields in *result* and apply *fallbacks* where missing
+    Validate the new fields in *result* and apply *fallbacks* where missing
     or malformed.  Logs a warning for every field repaired.  Never raises.
     """
     # problem_summary
@@ -491,6 +556,20 @@ def _validate_and_fill(result: dict, fallbacks: dict) -> dict:
     if not isinstance(result.get("expected_behavior"), str) or not result["expected_behavior"].strip():
         result["expected_behavior"] = fallbacks.get("expected_behavior", "")
         logger.warning("[phase4] expected_behavior missing — fallback applied.")
+
+    # missing_files — list of {path, reason, template}
+    mf = result.get("missing_files")
+    if not isinstance(mf, list):
+        result["missing_files"] = []
+        logger.warning("[phase4] missing_files absent — reset to [].")
+    else:
+        valid_mf: List[dict] = []
+        for item in mf:
+            if isinstance(item, dict) and "path" in item:
+                item.setdefault("reason", "")
+                item.setdefault("template", "")
+                valid_mf.append(item)
+        result["missing_files"] = valid_mf
 
     # fallback_locations — must be a list of dicts with at least file + function
     fl = result.get("fallback_locations")
@@ -635,6 +714,17 @@ def phase_llm_confirm(state: dict) -> dict:
     result["callees"]  = (matched_fn or {}).get("callees")  or []
     result["language"] = (matched_fn or {}).get("language") or ""
 
+    # Fallback : deduce language from file extension when phase-2 had no match.
+    if not result["language"]:
+        _ext = Path(result.get("file", "")).suffix.lower()
+        result["language"] = {
+            ".py": "python",  ".js": "javascript", ".ts": "typescript",
+            ".jsx": "javascript", ".tsx": "typescript", ".java": "java",
+            ".go": "go",      ".rs": "rust",        ".cpp": "cpp",
+            ".c":  "c",       ".cs": "c_sharp",     ".rb": "ruby",
+            ".kt": "kotlin",  ".swift": "swift",
+        }.get(_ext, "")
+
     # Guarantee all existing required keys are present.
     result.setdefault("file", "")
     result.setdefault("function", "")
@@ -667,7 +757,7 @@ def phase_llm_confirm(state: dict) -> dict:
         },
     )
 
-    # Fallback values for the 5 new fields.
+    # Fallback values for all new fields.
     title   = ticket.get("title", "")
     desc    = ticket.get("description", "")
     summary_fb = f"{title} — {desc[:200]}".strip(" —") if (title or desc) else ""
@@ -677,8 +767,67 @@ def phase_llm_confirm(state: dict) -> dict:
         "code_context":       actual_code_ctx,
         "patch_constraints":  actual_constraints,
         "expected_behavior":  f"Corriger le bug décrit dans : {result.get('root_cause', '')}",
+        "missing_files":      [],
         "fallback_locations": [],
     }
     result = _validate_and_fill(result, llm_fallbacks)
+
+    # ── Auto-correct: if 'file' is a missing file, swap to the caller ─────────
+    _missing_paths = {
+        mf.get("path", "").replace("\\", "/")
+        for mf in result.get("missing_files", [])
+    }
+    _result_file = result.get("file", "").replace("\\", "/")
+
+    if _result_file and _result_file in _missing_paths:
+        # Find the first fallback that is NOT itself missing
+        _caller_file = ""
+        _caller_fn   = ""
+        for _fb in result.get("fallback_locations", []):
+            _fb_file = _fb.get("file", "").replace("\\", "/")
+            if _fb_file and _fb_file not in _missing_paths:
+                _caller_file = _fb_file
+                _caller_fn   = _fb.get("function", result.get("function", ""))
+                break
+
+        if _caller_file:
+            logger.warning(
+                "[phase4] 'file' was a missing file (%s) — auto-corrected to caller: %s",
+                _result_file, _caller_file,
+            )
+            result["file"] = _caller_file
+            if _caller_fn:
+                result["function"] = _caller_fn
+
+            # Rebuild code_context from the corrected caller file
+            _repo_path  = state.get("repo_path", "")
+            _abs_caller = str(Path(_repo_path) / _caller_file) if _repo_path else _caller_file
+            _new_ctx    = extract_code_context(_abs_caller, result.get("line", 0))
+            if _new_ctx:
+                result["code_context"] = _new_ctx
+
+            # Rebuild patch_constraints with the corrected caller file
+            _corrected_pc = build_patch_constraints(
+                state,
+                {"file": _abs_caller, "function": result["function"], "line": result.get("line", 0)},
+            )
+            # Describe the full fix: modify caller + create missing file(s)
+            _missing_list = ", ".join(mf["path"] for mf in result.get("missing_files", []))
+            _corrected_pc["scope"] = (
+                f"In {_caller_file}, fix the import/include at line {result.get('line', '?')}. "
+                f"Also create: {_missing_list} using the provided templates."
+            )
+            result["patch_constraints"] = _corrected_pc
+
+            # Refresh language from new file extension if still empty
+            if not result.get("language"):
+                _ext2 = Path(_caller_file).suffix.lower()
+                result["language"] = {
+                    ".py": "python",  ".js": "javascript", ".ts": "typescript",
+                    ".jsx": "javascript", ".tsx": "typescript", ".java": "java",
+                    ".go": "go",      ".rs": "rust",        ".cpp": "cpp",
+                    ".c":  "c",       ".cs": "c_sharp",     ".rb": "ruby",
+                    ".kt": "kotlin",  ".swift": "swift",
+                }.get(_ext2, "")
 
     return {**state, "location": result, "confidence": confidence}
