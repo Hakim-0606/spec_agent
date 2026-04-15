@@ -444,7 +444,7 @@ def phase_treesitter(state: dict) -> dict:
                 "class":      None,
                 "start_line": 1,
                 "end_line":   len(lines),
-                "source":     "\n".join(lines[:80]),  # first 80 lines
+                "source":     "\n".join(lines[:100]),  # first 100 lines (covers imports + module body)
                 "signature":  f"# module: {Path(fpath).name}",
                 "callers":    [],
                 "callees":    [],
@@ -460,6 +460,30 @@ def phase_treesitter(state: dict) -> dict:
 
     if synthetic_added:
         logger.info("[phase2] Added %d synthetic module-level entries for files with no functions.", synthetic_added)
+
+    # ── Prop 4: Extract module headers (import blocks) for all BM25 files ────
+    # Stores the first MAX_HEADER_LINES lines of each file — captures imports,
+    # module-level variables, and class definitions. Used by Phase 4 to give the
+    # LLM full visibility into circular imports and module-level bugs.
+    MAX_HEADER_LINES = 60
+    file_import_blocks: Dict[str, str] = {}
+    for entry in bm25_files:
+        fpath = entry.get("file", "")
+        if not fpath:
+            continue
+        try:
+            raw_lines = Path(fpath).read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+            block = "\n".join(raw_lines[:MAX_HEADER_LINES])
+            if block.strip():
+                file_import_blocks[fpath] = block
+        except Exception:
+            pass
+    logger.info(
+        "[phase2] Module headers extracted for %d/%d BM25 files.",
+        len(file_import_blocks), len(bm25_files),
+    )
 
     langs_found = sorted({fn.get("language", "?") for fn in all_functions})
     logger.info(
@@ -502,7 +526,8 @@ def phase_treesitter(state: dict) -> dict:
 
     return {
         **state,
-        "repo_graph":    graph_data,
-        "ast_functions": top5,
-        "all_functions": all_functions,
+        "repo_graph":         graph_data,
+        "ast_functions":      top5,
+        "all_functions":      all_functions,
+        "file_import_blocks": file_import_blocks,   # Prop 4: module headers
     }

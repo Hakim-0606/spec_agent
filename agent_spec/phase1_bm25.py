@@ -47,6 +47,16 @@ STOP_WORDS = {
 # Score multiplier for files that appear in the MR diff.
 MR_FILE_BOOST = 2.0
 
+# Score multiplier for files explicitly named in a stack trace.
+# Stack trace signal is the strongest possible localization hint — ×5 puts
+# those files at the top regardless of BM25 lexical score.
+TRACE_FILE_BOOST = 5.0
+
+# Score multiplier for files derived from an ImportError / ModuleNotFoundError
+# module path in the ticket title.  Stronger than trace (×10) because the
+# module path is an exact, unambiguous reference to the missing/broken file.
+IMPORT_ERROR_BOOST = 10.0
+
 # BM25 retrieval width before fusion.
 BM25_RETRIEVAL_TOP  = 20
 EMBED_RETRIEVAL_TOP = 20
@@ -201,6 +211,177 @@ def _file_in_diff(fpath: str, mr_file_paths: set) -> bool:
     return any(normalized.endswith(p) or p in normalized for p in mr_file_paths)
 
 
+# ── Stack trace parsing ────────────────────────────────────────────────────────
+
+
+def _parse_stack_trace(error_trace: str) -> Dict:
+    """
+    Parse a stack trace string and return:
+        file_paths     : list of relative file paths mentioned (forward slashes, deduped)
+        exception_type : exception class name (e.g. 'KeyError', 'NullPointerException')
+        function_names : list of function/method names from the trace frames
+        line_numbers   : {file_path: last_seen_line_number}
+
+    Supports Python, JavaScript/TypeScript, Java, Go, and generic patterns.
+    The function_names list is ordered from innermost (crash site) to outermost (entry).
+    """
+    if not error_trace:
+        return {"file_paths": [], "exception_type": "", "function_names": [], "line_numbers": {}}
+
+    file_paths:     List[str] = []
+    function_names: List[str] = []
+    line_numbers:   Dict[str, int] = {}
+    seen_files: set = set()
+    seen_fns:   set = set()
+
+    # ── Python: File "path/to/file.py", line 42, in function_name ────────────
+    py_pat = re.compile(r'File "([^"]+\.py)", line (\d+)(?:, in (\w+))?')
+    for m in py_pat.finditer(error_trace):
+        raw_path = m.group(1).replace("\\", "/")
+        # Keep only the repo-relative portion: strip everything up to the first
+        # directory that looks like a project root (no leading slash, no /tmp/).
+        path = re.sub(r"^.*?/(?=[a-zA-Z0-9_])", "", raw_path.lstrip("/"), count=1)
+        lineno = int(m.group(2))
+        fn_name = m.group(3) or ""
+
+        if path and path not in seen_files:
+            seen_files.add(path)
+            file_paths.append(path)
+        line_numbers[path] = lineno
+
+        if fn_name and fn_name not in seen_fns and fn_name not in {"<module>", "<lambda>"}:
+            seen_fns.add(fn_name)
+            function_names.append(fn_name)
+
+    # ── JavaScript/TypeScript: at fn (path/file.js:42:10) ────────────────────
+    js_pat = re.compile(
+        r"at\s+(?:\S+\s+)?\(([^)]+\.(js|ts|jsx|tsx|mjs)):(\d+):\d+\)"
+    )
+    for m in js_pat.finditer(error_trace):
+        path = m.group(1).replace("\\", "/").lstrip("/")
+        lineno = int(m.group(3))
+        if path not in seen_files:
+            seen_files.add(path)
+            file_paths.append(path)
+        line_numbers[path] = lineno
+
+    # ── Java: at com.example.Class.method(FileName.java:42) ──────────────────
+    java_pat = re.compile(r"at\s+([\w.$]+)\((\w+\.java):(\d+)\)")
+    for m in java_pat.finditer(error_trace):
+        fname   = m.group(2)
+        lineno  = int(m.group(3))
+        fn_part = m.group(1).rsplit(".", 1)[-1]  # leaf method name
+        if fname not in seen_files:
+            seen_files.add(fname)
+            file_paths.append(fname)
+        line_numbers[fname] = lineno
+        if fn_part and fn_part not in seen_fns:
+            seen_fns.add(fn_part)
+            function_names.append(fn_part)
+
+    # ── Go: goroutine / file.go:42 ────────────────────────────────────────────
+    go_pat = re.compile(r"([a-zA-Z0-9_/.-]+\.go):(\d+)")
+    for m in go_pat.finditer(error_trace):
+        path   = m.group(1).replace("\\", "/").lstrip("/")
+        lineno = int(m.group(2))
+        if path not in seen_files:
+            seen_files.add(path)
+            file_paths.append(path)
+        line_numbers[path] = lineno
+
+    # ── Exception type ─────────────────────────────────────────────────────────
+    # Python/JS: "SomeError: message" at the last line of the trace.
+    exc_match = re.search(
+        r"^([A-Z]\w*(?:Error|Exception|Fault|Warning|Panic|Interrupt))\b",
+        error_trace,
+        re.MULTILINE,
+    )
+    exception_type = exc_match.group(1) if exc_match else ""
+
+    # Java: "Exception in thread ... com.example.SomeException"
+    if not exception_type:
+        java_exc = re.search(r"Exception in thread\s+\"\w+\"\s+(\S+Exception)", error_trace)
+        if java_exc:
+            exception_type = java_exc.group(1).rsplit(".", 1)[-1]
+
+    return {
+        "file_paths":     file_paths,
+        "exception_type": exception_type,
+        "function_names": function_names,
+        "line_numbers":   line_numbers,
+    }
+
+
+def _extract_import_module_paths(title: str, description: str) -> List[str]:
+    """
+    Detect ImportError / ModuleNotFoundError in the ticket title or description
+    and convert the Python module path to candidate file paths.
+
+    Examples:
+      "ImportError: cannot import name 'Customer' from ... 'apps.customers.models'"
+        → ["apps/customers/models.py"]
+      "ModuleNotFoundError: No module named 'apps.services.urls'"
+        → ["apps/services/urls.py", "apps/services/urls/__init__.py"]
+
+    Returns a list of relative file path candidates (forward slashes, no leading /).
+    """
+    combined = f"{title} {description[:500]}"
+    candidates: List[str] = []
+
+    # Pattern 1: ImportError: cannot import name '...' from '...' 'a.b.c'
+    # The module is the last quoted token after "from"
+    p1 = re.compile(
+        r"ImportError[^'\"]*from[^'\"]*['\"]([a-zA-Z0-9_.]+)['\"]",
+        re.IGNORECASE,
+    )
+    for m in p1.finditer(combined):
+        mod = m.group(1).strip("'\" ")
+        if mod:
+            candidates.append(mod.replace(".", "/") + ".py")
+            candidates.append(mod.replace(".", "/") + "/__init__.py")
+
+    # Pattern 2: ModuleNotFoundError: No module named 'a.b.c'
+    p2 = re.compile(r"No module named ['\"]([a-zA-Z0-9_.]+)['\"]", re.IGNORECASE)
+    for m in p2.finditer(combined):
+        mod = m.group(1).strip("'\" ")
+        if mod:
+            path = mod.replace(".", "/") + ".py"
+            init = mod.replace(".", "/") + "/__init__.py"
+            if path not in candidates:
+                candidates.append(path)
+            if init not in candidates:
+                candidates.append(init)
+
+    # Pattern 3: partially initialized module 'a.b.c'
+    p3 = re.compile(r"partially initialized module ['\"]([a-zA-Z0-9_.]+)['\"]", re.IGNORECASE)
+    for m in p3.finditer(combined):
+        mod = m.group(1).strip("'\" ")
+        if mod:
+            path = mod.replace(".", "/") + ".py"
+            if path not in candidates:
+                candidates.append(path)
+
+    return candidates
+
+
+def _file_in_trace(fpath: str, trace_file_paths: List[str]) -> bool:
+    """
+    True when *fpath* (absolute or relative) matches one of the trace file paths.
+
+    Matching is intentionally loose: a trace may report a path relative to the
+    project root while BM25 holds the absolute path, or vice-versa.
+    We check:
+      1. fpath ends with trace_path         (e.g. /repo/foo/bar.py ends with foo/bar.py)
+      2. trace_path ends with basename(fpath)  (for Java .java filename-only entries)
+    """
+    norm = fpath.replace("\\", "/")
+    for tp in trace_file_paths:
+        tp_norm = tp.replace("\\", "/")
+        if norm.endswith(tp_norm) or tp_norm.endswith(norm.split("/")[-1]):
+            return True
+    return False
+
+
 # ── RRF helpers ────────────────────────────────────────────────────────────────
 
 
@@ -305,9 +486,11 @@ def phase_bm25(state: dict) -> dict:
     Optimisation : si project_structure["files"] existe (Phase 0 a tourné),
     la liste de fichiers est réutilisée sans re-scanner le repo.
     """
-    ticket    = state["ticket"]
-    mr_diff   = state["mr_diff"]
-    repo_path = state["repo_path"]
+    ticket        = state["ticket"]
+    mr_diff       = state["mr_diff"]
+    repo_path     = state["repo_path"]
+    extra_context = state.get("extra_context") or {}
+    error_trace   = extra_context.get("error_trace", "")
 
     # Réutiliser la liste de Phase 0 si disponible (évite le double scan rglob).
     struct_files = state.get("project_structure", {}).get("files", [])
@@ -325,14 +508,67 @@ def phase_bm25(state: dict) -> dict:
     tokenized_corpus = [_tokenize(c) for c in contents]
     bm25 = BM25Okapi(tokenized_corpus)
 
+    # ── Stack trace signal — highest priority ──────────────────────────────────
+    trace_info     = _parse_stack_trace(error_trace)
+    trace_paths    = trace_info["file_paths"]
+    exception_type = trace_info["exception_type"]
+    trace_fns      = trace_info["function_names"]
+
+    # Build BM25 query: start from ticket+diff keywords, then prepend trace
+    # function names and exception type so the most precise signals rank first.
     keywords = extract_keywords(ticket, mr_diff) or ["bug", "error", "exception"]
-    scores   = bm25.get_scores(keywords).tolist()
+
+    # Prepend stack-trace function names (innermost first — crash site).
+    trace_fn_tokens: List[str] = []
+    for fn in trace_fns[:5]:
+        for tok in _tokenize(fn):
+            if tok not in keywords and tok not in trace_fn_tokens:
+                trace_fn_tokens.append(tok)
+    keywords = trace_fn_tokens + keywords
+
+    # Prepend exception type tokens (e.g. "keyerror" → strong BM25 signal).
+    if exception_type:
+        for tok in reversed(_tokenize(exception_type)):
+            if tok not in keywords:
+                keywords.insert(0, tok)
+
+    if trace_paths:
+        logger.info(
+            "[phase1] Stack trace: %d files, exception=%r, functions=%s",
+            len(trace_paths), exception_type, trace_fns[:3],
+        )
+
+    scores = bm25.get_scores(keywords).tolist()
 
     # Boost files that the MR diff directly touches.
     mr_paths = _parse_mr_file_paths(mr_diff)
     for i, fpath in enumerate(files):
         if _file_in_diff(fpath, mr_paths):
             scores[i] *= MR_FILE_BOOST
+
+    # Boost files explicitly named in the stack trace (applied after MR boost
+    # so that a file in both diff and trace gets the full compound multiplier).
+    if trace_paths:
+        for i, fpath in enumerate(files):
+            if _file_in_trace(fpath, trace_paths):
+                scores[i] *= TRACE_FILE_BOOST
+
+    # Boost files derived from ImportError / ModuleNotFoundError module path in
+    # the ticket title / description.  Strongest signal (×10) because it names
+    # the exact broken module.  Applied last so it compounds with MR + trace.
+    import_module_paths = _extract_import_module_paths(
+        ticket.get("title", ""),
+        ticket.get("description", ""),
+    )
+    if import_module_paths:
+        logger.info("[phase1] ImportError module paths detected: %s", import_module_paths)
+        for i, fpath in enumerate(files):
+            norm = fpath.replace("\\", "/")
+            for mp in import_module_paths:
+                if norm.endswith(mp) or norm.endswith(mp.replace("/__init__.py", ".py")):
+                    scores[i] *= IMPORT_ERROR_BOOST
+                    logger.info("[phase1] ImportError boost ×%.0f → %s", IMPORT_ERROR_BOOST, fpath)
+                    break
 
     # Top-20 for RRF input (wider than the old top-10).
     bm25_ranked: List[Dict] = sorted(

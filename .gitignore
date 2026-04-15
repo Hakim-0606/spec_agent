@@ -61,3 +61,21 @@ orchestrator_tmp/
 orchestrator2/
 
 test_tools.py
+
+orchestrator_tmp/
+
+orchestrator2/
+
+test-repo-django/
+
+workspace/
+
+test_coder.py
+
+run_full_pipeline.py
+
+run_spec_test.py
+
+test_pipeline.py
+
+github_connector.py

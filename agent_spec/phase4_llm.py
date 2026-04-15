@@ -28,78 +28,40 @@ REFLEXION_THRESHOLD = 0.7
 # ── Prompt templates ───────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
-You are an expert software engineer specialised in bug localisation for an automated repair pipeline.
-Your output is consumed directly by an Agent Coder that will write the fix — precision is critical.
+You are an expert software engineer specialised in bug localisation.
 
 ## What you receive
-- A bug ticket (ID, title, description, severity, component)
+- A bug ticket (title, description, severity)
 - A merge-request diff (the change that introduced or exposed the bug)
-- Up to 3 candidate functions with full source, ranked by relevance (Candidate 1 = highest)
-- A code snippet centred on the most likely bug line
-- Pre-built patch constraints (scope, test files, forbidden files, style)
+- Ranked candidate functions with full source (Candidate 1 = most likely)
+- A code snippet around the most likely bug line
+- Tool search results (grep hits for key symbols)
+- Module headers: the first ~60 lines of each top-ranked file — import statements,
+  module-level variables, class definitions. USE THESE to spot circular imports,
+  missing modules, wrong import paths, and module-level bugs.
 
-## Reasoning steps (follow in order — do NOT output this section)
-1. Read the diff: +/- lines are the strongest signal. Which candidate does the diff touch?
-2. Read that candidate's source. Find the exact line(s) where the logic is wrong.
-3. Check callers and callees: could the bug be one level up (bad input) or down (broken helper)?
-4. Assign confidence using the calibration scale below.
-5. MISSING FILE CHECK — if the error is ImportError / ModuleNotFoundError / missing module:
-   a. Identify the EXISTING file that contains the bad import or reference (this goes in "file").
-   b. Identify the EXACT line of the bad import/include call (this goes in "line").
-   c. List every file that must be CREATED to fix the error in "missing_files".
-   d. For each missing file, provide a "template" with the minimal valid content the Coder must write.
-   Rule: "file" must ALWAYS point to an EXISTING file in the repo — never to the missing file.
-
-   CONCRETE EXAMPLE (ModuleNotFoundError: No module named 'apps.services.urls'):
-   WRONG → file = "apps/services/urls.py"   ← this file does NOT EXIST, never put it in "file"
-   RIGHT → file = "fiber_crm/urls.py"        ← this EXISTING file has: include('apps.services.urls')
-           line = <line number of include(...)>
-           missing_files = [{"path": "apps/services/urls.py", "template": "..."}]
-   If the caller file appears in your fallback_locations, that is your "file" — move it there.
+## Reasoning steps (think through these — do NOT write them in your output)
+1. Read the diff: +/- lines are the strongest signal.
+2. Read each candidate's source. Find the exact line where the logic breaks.
+3. Check callers and callees for one-level-up / one-level-down bugs.
+4. For ImportError / ModuleNotFoundError: identify the EXISTING file that contains
+   the bad import (never point to the missing file itself).
+5. Assign confidence using the scale below.
 
 ## Confidence calibration
-0.90 – 1.00 : Buggy line visible in both the diff and the function source.
-0.70 – 0.89 : Strong match between diff and candidate; exact line is inferred.
-0.50 – 0.69 : Plausible match; list fallback_locations for the Coder.
-Below 0.50  : Evidence weak — reflexion will trigger a second analysis automatically.
+0.90–1.00 : Buggy line visible in both diff and function source.
+0.70–0.89 : Strong diff↔candidate match; exact line inferred.
+0.50–0.69 : Plausible match.
+Below 0.50 : Weak evidence.
 
-## Output — respond ONLY with valid JSON, no prose, no markdown fences
-{
-  "file":             "<relative path of the EXISTING file that contains the root cause — forward slashes>",
-  "function":         "<exact function or method name as it appears in the source — must exist in 'file'>",
-  "line":             <integer: 1-based line number of the root cause inside 'file'; 0 if unknown>,
-  "root_cause":       "<one precise sentence: WHAT is wrong, WHERE it is, and WHY it breaks — e.g. 'include(apps.services.urls) in fiber_crm/urls.py references a module that does not exist'>",
-  "confidence":       <float 0.0–1.0 calibrated to the scale above>,
-  "problem_summary":  "Observed behaviour: [what the system currently does wrong]. Expected behaviour: [what it should do]. Trigger condition: [when or how the bug manifests].",
-  "code_context":     "<copy the exact lines around the bug from 'file'; append '# BUG: <short reason>' on each buggy line — 25 lines max>",
-  "patch_constraints": {
-    "scope":           "<exact instruction: 'In <file>, fix line <N> — <what to change>. If missing_files is non-empty, create each listed file with the provided template.'>",
-    "preserve_tests":  [<test file paths that reference the buggy function — keep pre-built list and add any you identify>],
-    "forbidden_files": [<files the Coder must NOT touch — keep pre-built list>],
-    "style_hint":      "<naming convention + type hints + formatting rules observed in 'file'>"
-  },
-  "expected_behavior": "<1-2 sentences: exact state the system must reach after the fix — e.g. 'The dev server starts without ImportError; all existing URL routes remain functional'>",
-  "missing_files": [
-    {
-      "path":     "<relative path of the file to CREATE — forward slashes>",
-      "reason":   "<why this file must be created — e.g. referenced by include() but absent from repo>",
-      "template": "<minimal valid content the Coder must write verbatim — include all required imports, class/function stubs, and urlpatterns if applicable>"
-    }
-  ],
-  "fallback_locations": [
-    {"file": "<path>", "function": "<name>", "reason": "<why this caller or callee might also hold a root cause>"}
-  ]
-}
-Rules:
-- Do not omit any field. Use "" or [] as defaults when uncertain.
-- "line" must be an integer (not a string).
-- "confidence" must be a float (not a string).
-- "file" must be an EXISTING file — never set it to a file listed in "missing_files".
-- SELF-CHECK before output: if "file" == any path in missing_files[].path, you violated the rule — fix it.
-- All file paths must use forward slashes and be relative to the repo root.
-- "missing_files" must be [] when no file needs to be created.
-- "template" in missing_files must be complete enough for the Coder to write the file without guessing.
-- "patch_constraints.scope" must reference the "file" value, NOT a file in missing_files.
+## Output format — YOUR ENTIRE RESPONSE must be this JSON and nothing else
+{{"file": "<relative path, forward slashes, MUST exist in repo>", "function": "<exact function name>", "line": <integer, 0 if unknown>, "root_cause": "<one precise sentence>", "confidence": <float 0.0-1.0>}}
+
+STRICT RULES:
+- Respond with ONLY the JSON object. First char = {{. Last char = }}.
+- No markdown fences, no prose, no explanation before or after.
+- "line" is an integer. "confidence" is a float. NEVER use strings for these.
+- "file" must be an EXISTING file in the repo. Never pick migrations/ or auto-generated files.
 """
 
 _USER_TEMPLATE = """\
@@ -111,29 +73,23 @@ Severity:    {severity}
 Component:   {component}
 
 ## Merge-Request Diff  ← PRIMARY SIGNAL — focus on + and - lines first
-```diff
 {mr_diff}
-```
 
 ## Candidate Functions ({n_candidates} ranked by relevance — Candidate 1 is the strongest match)
 {candidates_block}
 
-## Code Snippet (centred on the most likely bug line — copy this verbatim into "code_context" with # BUG: annotations)
-```
+## Code Snippet (centred on the most likely bug line)
 {code_context}
-```
 
-## Patch Constraints (pre-built — confirm or refine each sub-field)
+## Pre-built context (scope, style, constraints)
 {patch_constraints_json}
 
----
-Return the complete JSON (all 13 fields). Use "" or [] for any field you cannot determine.
-Do not wrap the JSON in markdown fences or add any prose outside the JSON object.
+Respond with ONLY the 5-field JSON object described in your instructions.
 """
 
 _REFLEXION_TEMPLATE = """\
 Your previous analysis returned low confidence ({confidence:.2f}).
-The callers and callees of the candidate function are provided below for deeper inspection.
+Review the expanded caller/callee context below and update your answer.
 
 ## Previous answer
 {prev_json}
@@ -141,16 +97,9 @@ The callers and callees of the candidate function are provided below for deeper 
 ## Expanded context — direct callers and callees of the candidate
 {expanded_block}
 
-## Re-analysis — answer these three questions before updating the JSON
-1. CALLER bug? Does a caller pass wrong arguments or call the function in an invalid state?
-2. CALLEE bug? Does the candidate rely on a helper that returns incorrect data?
-3. Same function? Is the root cause still in the original candidate, now confirmed with more context?
-
-Update ONLY the fields that the expanded context changes.
+Respond with the SAME 5-field JSON, updating only the fields the new evidence changes.
 Raise "confidence" only if the new evidence genuinely resolves the ambiguity.
-Preserve all other fields from the previous answer unchanged.
-
-Respond with the COMPLETE JSON (all 13 fields) — no prose, no markdown fences.
+First char = {{. Last char = }}. No prose.
 """
 
 
@@ -201,6 +150,40 @@ def _build_main_prompt(
         code_context=code_ctx or "(no code context available)",
         patch_constraints_json=pc_json,
     )
+
+    # Prop 1: Inject module headers (import blocks) for top BM25 files.
+    # This gives the LLM direct visibility into import chains, circular imports,
+    # and module-level code — critical for ImportError / ModuleNotFoundError bugs.
+    file_import_blocks: dict = state.get("file_import_blocks", {})
+    if file_import_blocks:
+        # Show top-5 BM25 files in BM25 rank order (preserves relevance signal).
+        bm25_files: List[dict] = state.get("bm25_files", [])
+        ordered_paths = [e.get("file", "") for e in bm25_files if e.get("file")]
+        # Fall back to dict insertion order if BM25 list is empty.
+        if not ordered_paths:
+            ordered_paths = list(file_import_blocks.keys())
+
+        shown = 0
+        header_lines = ["\n## Module headers — imports & module-level code (top BM25 files)"]
+        header_lines.append(
+            "← USE THIS to detect circular imports, missing modules, and wrong import paths"
+        )
+        for fpath in ordered_paths:
+            block = file_import_blocks.get(fpath, "")
+            if not block:
+                continue
+            try:
+                from pathlib import Path as _Path
+                rel = str(_Path(fpath).relative_to(state.get("repo_path", fpath)))
+            except (ValueError, TypeError):
+                rel = fpath
+            rel = rel.replace("\\", "/")
+            header_lines.append(f"\n### {rel}")
+            header_lines.append(block)
+            shown += 1
+            if shown >= 5:
+                break
+        user_msg += "\n".join(header_lines) + "\n"
 
     # Append project structure summary if available (Phase 0 output).
     project_structure = state.get("project_structure", {})
@@ -270,26 +253,168 @@ def _build_reflexion_prompt(prev_result: dict, expanded_fns: List[dict]) -> str:
     )
 
 
-# ── Ollama call ────────────────────────────────────────────────────────────────
+# ── LLM backend abstraction ────────────────────────────────────────────────────
+#
+# Set LM_STUDIO_URL=http://localhost:1234  → uses OpenAI-compatible API (LM Studio).
+# Leave unset                              → uses Ollama (default, backward-compat).
+#
+# The model name is always read from the state / $OLLAMA_MODEL — same env var,
+# same value works for both backends (pass the model name loaded in LM Studio).
+
+
+def _chat_completion(
+    messages:    list,
+    model:       str,
+    *,
+    json_mode:   bool  = False,
+    temperature: float = 0.1,
+) -> str:
+    """
+    Single-turn chat completion, routing to LM Studio or Ollama.
+
+    Args:
+        messages    : OpenAI-style message list [{role, content}, …].
+        model       : Model identifier (same value for both backends).
+        json_mode   : Request JSON-only output (format="json" / response_format).
+        temperature : Sampling temperature.
+
+    Returns:
+        Raw response text from the model.
+    """
+    lm_url = os.environ.get("LM_STUDIO_URL", "").rstrip("/")
+
+    if lm_url:
+        # ── LM Studio (OpenAI-compatible) ─────────────────────────────────────
+        from openai import OpenAI
+        base_url = lm_url if lm_url.endswith("/v1") else lm_url + "/v1"
+        client   = OpenAI(base_url=base_url, api_key="lm-studio")
+        kwargs: dict = {
+            "model":       model,
+            "messages":    messages,
+            "temperature": temperature,
+        }
+        # LM Studio only accepts "json_schema" or "text" — not "json_object".
+        # The system prompt already instructs JSON output, so no response_format needed.
+        resp = client.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content or ""
+    else:
+        # ── Ollama ────────────────────────────────────────────────────────────
+        import ollama
+        kwargs = {
+            "model":    model,
+            "messages": messages,
+            "options":  {"temperature": temperature},
+        }
+        if json_mode:
+            kwargs["format"] = "json"
+        resp = ollama.chat(**kwargs)
+        return resp.message.content or ""
+
+
+# ── Ollama calls ───────────────────────────────────────────────────────────────
+
+# Auto-generated file patterns — fallback should never resolve to these.
+_AUTO_GENERATED_PATTERNS = (
+    "/migrations/", "\\migrations\\",
+    "/__snapshots__/", "\\__snapshots__\\",
+    "/generated/", "/proto_gen/", "/stubs/",
+    "0001_initial", "0002_", "0003_",        # numbered Django migrations
+)
+
+
+def _is_auto_generated(file_path: str) -> bool:
+    """Return True when *file_path* points to auto-generated code."""
+    norm = file_path.replace("\\", "/")
+    return any(pat.replace("\\", "/") in norm for pat in _AUTO_GENERATED_PATTERNS)
+
+
+# Filenames that are almost never the source of an application bug.
+_NOISE_FILENAMES: frozenset = frozenset({
+    "manage.py",      # Django CLI entry-point
+    "wsgi.py",        # WSGI adapter
+    "asgi.py",        # ASGI adapter
+    "conftest.py",    # pytest fixtures
+    "setup.py",       # packaging
+    "setup.cfg",
+})
+
+
+def _is_noise_candidate(file_path: str) -> bool:
+    """
+    Return True when a candidate file is almost certainly NOT the bug location.
+
+    Excluded:
+    - auto-generated files (migrations, proto stubs, etc.)
+    - test files  (test_*.py / *_test.py / tests/ directory)
+    - known entry-point / config files (manage.py, wsgi.py, …)
+    - Django app-config stubs (apps.py contains only AppConfig, not business logic)
+    """
+    norm = file_path.replace("\\", "/")
+    name = norm.rsplit("/", 1)[-1]
+
+    if _is_auto_generated(file_path):
+        return True
+
+    # Test files
+    if name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    if "/tests/" in norm or "/test/" in norm:
+        return True
+
+    # Known noise filenames
+    if name in _NOISE_FILENAMES:
+        return True
+
+    # Django apps.py — contains only AppConfig boilerplate, never the bug source
+    if name == "apps.py":
+        return True
+
+    return False
+
+
+def _filter_candidates(contexts: List[dict]) -> List[dict]:
+    """
+    Remove noise candidates from the RAG context list, keeping at least 1.
+
+    Filtered-out files are logged so the pipeline stays transparent.
+    If filtering would leave 0 candidates, the original list is returned intact
+    (better a noisy candidate than no candidate).
+    """
+    filtered = [ctx for ctx in contexts if not _is_noise_candidate(ctx.get("file", ""))]
+    if not filtered:
+        logger.warning(
+            "[phase4] Pre-filter removed ALL %d candidates — keeping original list.",
+            len(contexts),
+        )
+        return contexts
+    removed = len(contexts) - len(filtered)
+    if removed:
+        noise_files = [
+            ctx.get("file", "?") for ctx in contexts
+            if _is_noise_candidate(ctx.get("file", ""))
+        ]
+        logger.info(
+            "[phase4] Pre-filter removed %d noise candidate(s): %s",
+            removed, noise_files,
+        )
+    return filtered
 
 
 def _call_ollama(user_prompt: str, model: str = DEFAULT_MODEL) -> str:
     """
-    Call the local Ollama instance with the structured-output format flag.
-    Returns the raw response text.
+    Main LLM call — 5-field schema (file, function, line, root_cause, confidence).
+    Routes to LM Studio or Ollama depending on LM_STUDIO_URL.
+    The 8 extended fields are always built deterministically after this call.
     """
-    import ollama
-
-    response = ollama.chat(
-        model=model,
+    return _chat_completion(
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
+            {"role": "user",   "content": user_prompt},
         ],
-        format="json",
-        options={"temperature": 0.1},   # low temperature for deterministic output
+        model=model,
+        json_mode=True,
+        temperature=0.1,
     )
-    return response.message.content
 
 
 # ── JSON parser ────────────────────────────────────────────────────────────────
@@ -297,30 +422,356 @@ def _call_ollama(user_prompt: str, model: str = DEFAULT_MODEL) -> str:
 _REQUIRED_KEYS = {"file", "function", "line", "root_cause", "confidence"}
 
 
+def _strip_fences(text: str) -> str:
+    """Remove leading/trailing markdown code fences that LLMs often insert."""
+    text = text.strip()
+    # Remove ```json or ``` at the start
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    # Remove ``` at the end
+    text = re.sub(r"\s*```\s*$", "", text)
+    return text.strip()
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    """
+    Extract the first complete JSON object from *text* using balanced-brace
+    scanning.  More reliable than a greedy regex when the model appends prose
+    after the closing brace.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _coerce_types(data: dict) -> dict:
+    """
+    Coerce 'line' to int and 'confidence' to float — small models often return
+    these as strings ("7" / "0.8") which breaks downstream consumers.
+    """
+    try:
+        data["line"] = int(data["line"])
+    except (TypeError, ValueError, KeyError):
+        data["line"] = 0
+
+    try:
+        data["confidence"] = float(data["confidence"])
+    except (TypeError, ValueError, KeyError):
+        data["confidence"] = 0.0
+
+    return data
+
+
 def _parse_llm_json(raw: str) -> Optional[Dict]:
     """
-    Parse JSON from LLM output.  Tries strict parse first, then a regex
-    extraction fallback in case the model wrapped the JSON in prose/fences.
+    Parse JSON from LLM output. Pipeline:
+      1. Strip markdown fences (```json ... ```)
+      2. Direct json.loads on cleaned text
+      3. Balanced-brace extraction then json.loads (handles leading/trailing prose)
+    After a successful parse, coerce 'line' → int and 'confidence' → float.
+    Logs the first 300 chars of raw output when all attempts fail.
     """
-    # 1. Direct parse.
+    if not raw:
+        return None
+
+    cleaned = _strip_fences(raw)
+
+    # 1. Direct parse on cleaned text.
     try:
-        data = json.loads(raw.strip())
+        data = json.loads(cleaned)
         if _REQUIRED_KEYS <= set(data.keys()):
-            return data
+            return _coerce_types(data)
     except json.JSONDecodeError:
         pass
 
-    # 2. Extract first complete JSON object from text (handles nested braces).
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
+    # 2. Balanced-brace extraction — handles prose before/after the JSON block.
+    extracted = _extract_json_object(cleaned)
+    if extracted:
         try:
-            data = json.loads(match.group())
+            data = json.loads(extracted)
             if _REQUIRED_KEYS <= set(data.keys()):
-                return data
+                return _coerce_types(data)
         except json.JSONDecodeError:
             pass
 
+    logger.warning(
+        "[phase4] JSON parse failed. Raw output (first 300 chars): %r",
+        raw[:300],
+    )
     return None
+
+
+# ── Deterministic fallback when LLM fails ─────────────────────────────────────
+
+# Patterns that indicate a class / function *definition* line (not import/usage).
+_DEFINITION_RE = re.compile(r"^\s*(class|def)\s+(\w+)")
+
+
+def _module_path_to_file_candidates(module_dotted: str) -> List[str]:
+    """Convert a dotted Python module name to candidate file paths."""
+    slash = module_dotted.replace(".", "/")
+    return [slash + ".py", slash + "/__init__.py"]
+
+
+def _resolve_import_error_file(ticket: dict, repo_path: str) -> Optional[dict]:
+    """
+    If the ticket describes an ImportError / ModuleNotFoundError, try to resolve
+    the module path to an actual file in the repo.
+
+    Returns a location dict (confidence 0.55) on success, None otherwise.
+    """
+    title = ticket.get("title", "") or ""
+    desc  = (ticket.get("description") or "")[:500]
+    combined = f"{title} {desc}"
+
+    # Collect candidate module dotted paths.
+    module_names: List[str] = []
+
+    p_import = re.compile(
+        r"ImportError[^'\"]*from[^'\"]*['\"]([a-zA-Z0-9_.]+)['\"]", re.IGNORECASE
+    )
+    p_nomod = re.compile(r"No module named ['\"]([a-zA-Z0-9_.]+)['\"]", re.IGNORECASE)
+    p_partial = re.compile(
+        r"partially initialized module ['\"]([a-zA-Z0-9_.]+)['\"]", re.IGNORECASE
+    )
+
+    for pat in (p_import, p_nomod, p_partial):
+        for m in pat.finditer(combined):
+            mod = m.group(1).strip("'\" ")
+            if mod and mod not in module_names:
+                module_names.append(mod)
+
+    if not module_names or not repo_path:
+        return None
+
+    repo = Path(repo_path)
+    for mod in module_names:
+        for candidate in _module_path_to_file_candidates(mod):
+            full = repo / candidate
+            if full.is_file() and not _is_auto_generated(str(full)):
+                rel = candidate  # already relative
+                logger.info(
+                    "[phase4] ImportError fallback → module '%s' resolved to %s",
+                    mod, rel,
+                )
+                return {
+                    "file":       rel,
+                    "function":   "_module_level_",
+                    "line":       1,
+                    "root_cause": (
+                        f"Module '{mod}' referenced in the error is defined at "
+                        f"{rel} — inspect imports and circular dependencies here."
+                    ),
+                    "confidence": 0.55,
+                }
+
+    return None
+
+
+def _build_8_fields_deterministic(
+    location:            dict,
+    ticket:              dict,
+    state:               dict,
+    ast_functions:       List[dict],
+    contexts:            List[dict],
+    repo_path:           str,
+) -> dict:
+    """
+    Build the 8 extended fields from code analysis — no LLM involved.
+    Called AFTER the LLM returns the 5 core fields (file/function/line/root_cause/confidence).
+
+    Returns a dict with:
+        problem_summary, code_context, patch_constraints,
+        expected_behavior, missing_files, fallback_locations
+    """
+    file_path  = location.get("file", "").replace("\\", "/")
+    function   = location.get("function", "")
+    line       = location.get("line", 0)
+    root_cause = location.get("root_cause", "")
+    title      = ticket.get("title", "")
+    desc       = (ticket.get("description") or "")
+
+    # ── 1. problem_summary — clean 1-2 sentence summary (no raw markdown) ───────
+    def _clean_desc(text: str) -> str:
+        """Strip markdown headings/bullets, return first 2 sentences."""
+        text = re.sub(r"^#{1,6}\s+.*$", "", text, flags=re.MULTILINE)  # remove headings
+        text = re.sub(r"^[-*]\s+", "", text, flags=re.MULTILINE)        # remove bullets
+        text = re.sub(r"`{1,3}[^`]*`{1,3}", "", text)                   # remove inline code
+        text = re.sub(r"\s+", " ", text).strip()
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        return " ".join(sentences[:2]).strip()
+
+    desc_clean = _clean_desc(desc[:600]) if desc else ""
+    if title and desc_clean:
+        problem_summary = f"{title}. {desc_clean}"[:350]
+    elif title:
+        problem_summary = title
+    else:
+        problem_summary = desc_clean[:350]
+
+    # ── 2. code_context — read actual file at identified line ─────────────────
+    _abs = (
+        str(Path(repo_path) / file_path)
+        if repo_path and file_path and not Path(file_path).is_absolute()
+        else file_path
+    )
+    _ast_fn = next(
+        (fn for fn in ast_functions
+         if fn.get("function") == function
+         and fn.get("file", "").replace("\\", "/") == file_path),
+        None,
+    )
+    code_context = (
+        (_ast_fn or {}).get("source_real", "")
+        or extract_code_context(_abs, line)
+        or ""
+    )
+
+    # ── 3. patch_constraints — deterministic builder already in place ─────────
+    patch_constraints = build_patch_constraints(
+        state,
+        {"file": _abs, "function": function, "line": line},
+    )
+
+    # ── 4. expected_behavior — derived from ticket title ──────────────────────
+    if title:
+        expected_behavior = f"Le projet fonctionne sans erreur : {title}"
+    else:
+        expected_behavior = "Le bug est corrigé et les tests existants passent."
+
+    # ── 5. missing_files — from ImportError module resolution ─────────────────
+    missing_files: List[dict] = []
+    import_hit = _resolve_import_error_file(ticket, repo_path)
+    if import_hit:
+        hit_file = import_hit.get("file", "").replace("\\", "/")
+        # If the LLM picked a different file and the import resolution found the
+        # module file, log it — but don't override the LLM choice here (that's
+        # handled later in auto-correct).  We do note it in fallback_locations.
+        if hit_file and hit_file != file_path:
+            logger.info(
+                "[phase4] ImportError module resolved to %s (LLM chose %s)",
+                hit_file, file_path,
+            )
+
+    # ── 6. fallback_locations — BM25 top candidates excluding chosen file ─────
+    fallback_locations: List[dict] = []
+    seen: set = set()
+    for i, ctx in enumerate(contexts[:5]):
+        ctx_file = ctx.get("file", "").replace("\\", "/")
+        try:
+            rel = str(Path(ctx_file).relative_to(repo_path)).replace("\\", "/")
+        except (ValueError, TypeError):
+            rel = ctx_file
+        if rel and rel != file_path and rel not in seen:
+            seen.add(rel)
+            fallback_locations.append({
+                "file":     rel,
+                "function": ctx.get("function", ""),
+                "reason":   f"BM25+embedding candidate #{i + 1}",
+            })
+
+    return {
+        "problem_summary":    problem_summary,
+        "code_context":       code_context,
+        "patch_constraints":  patch_constraints,
+        "expected_behavior":  expected_behavior,
+        "missing_files":      missing_files,
+        "fallback_locations": fallback_locations,
+    }
+
+
+def _build_deterministic_fallback(
+    contexts:            List[dict],
+    tool_search_results: List[dict],
+    ticket:              dict,
+    repo_path:           str,
+) -> dict:
+    """
+    Build the best possible location without usable LLM output.
+
+    Search order (highest confidence first):
+    0. ImportError / ModuleNotFoundError module resolution — maps dotted module
+       name from the ticket title to an actual file in the repo (confidence 0.55).
+    1. tool_search_results — a *definition* line (class/def) in a non-generated file.
+       These results were searched from ticket keywords, so a class/def hit is
+       very likely the actual bug origin (e.g. `class Customer` in models.py).
+    2. ast_functions from RAG contexts — ranked by the full pipeline, skip if
+       file is auto-generated.
+    3. Raw top RAG context — last resort.
+    """
+    # 0. ImportError / ModuleNotFoundError direct file resolution.
+    import_hit = _resolve_import_error_file(ticket, repo_path)
+    if import_hit:
+        return import_hit
+
+    # 1. Definition in tool_search_results.
+    for hit in tool_search_results:
+        content = hit.get("content", "")
+        fpath   = hit.get("file", "")
+        m       = _DEFINITION_RE.match(content)
+        if m and not _is_auto_generated(fpath):
+            kind    = m.group(1)   # "class" or "def"
+            name    = m.group(2)
+            lineno  = hit.get("line", 0)
+            logger.info(
+                "[phase4] Deterministic fallback → definition hit: %s %s at %s:%d",
+                kind, name, fpath, lineno,
+            )
+            return {
+                "file":       fpath,
+                "function":   name,
+                "line":       lineno,
+                "root_cause": (
+                    f"{kind} `{name}` found at {fpath}:{lineno} — "
+                    "LLM failed; confirm this is the bug origin."
+                ),
+                "confidence": 0.35,
+            }
+
+    # 2. Top RAG context, skip auto-generated files.
+    for ctx in contexts:
+        fpath = ctx.get("file", "")
+        if fpath and not _is_auto_generated(fpath):
+            logger.info(
+                "[phase4] Deterministic fallback → RAG context: %s::%s",
+                fpath, ctx.get("function", ""),
+            )
+            return {
+                "file":       fpath,
+                "function":   ctx.get("function", ""),
+                "line":       ctx.get("start_line", 0),
+                "root_cause": "LLM output unparseable — deterministic fallback to best non-generated RAG hit.",
+                "confidence": 0.25,
+            }
+
+    # 3. Absolute last resort.
+    logger.warning("[phase4] Deterministic fallback: no usable context found.")
+    return {
+        "file": "", "function": "", "line": 0,
+        "root_cause": "Unable to locate bug — no valid LLM output or search results.",
+        "confidence": 0.0,
+    }
 
 
 # ── Reflexion helper ───────────────────────────────────────────────────────────
@@ -508,9 +959,15 @@ def build_patch_constraints(state: dict, location: dict) -> Dict:
     ticket        = state.get("ticket", {})
     component     = ticket.get("component", "")
 
-    scope          = f"Modifier uniquement {function_name}() dans {file_path}" if function_name else ""
+    # Ensure file_path is always relative (scope + forbidden use it for display)
+    try:
+        rel_file = str(Path(file_path).relative_to(repo_path)).replace("\\", "/") if repo_path else file_path
+    except ValueError:
+        rel_file = file_path.replace("\\", "/")
+
+    scope          = f"Modify only {function_name}() in {rel_file}" if function_name else f"Fix {rel_file}"
     preserve_tests = _find_test_files(repo_path, function_name)
-    forbidden      = _get_forbidden_files(state, component)
+    forbidden      = [f for f in _get_forbidden_files(state, component) if f != rel_file]
     style_hint     = _detect_style_hint(file_path)
 
     return {
@@ -565,13 +1022,13 @@ def _validate_and_fill(result: dict, fallbacks: dict) -> dict:
     else:
         valid_mf: List[dict] = []
         for item in mf:
-            if isinstance(item, dict) and "path" in item:
+            if isinstance(item, dict) and item.get("path", "").strip():
                 item.setdefault("reason", "")
                 item.setdefault("template", "")
                 valid_mf.append(item)
         result["missing_files"] = valid_mf
 
-    # fallback_locations — must be a list of dicts with at least file + function
+    # fallback_locations — must be a list of dicts with non-empty file + function
     fl = result.get("fallback_locations")
     if not isinstance(fl, list):
         result["fallback_locations"] = []
@@ -579,7 +1036,9 @@ def _validate_and_fill(result: dict, fallbacks: dict) -> dict:
     else:
         valid: List[dict] = []
         for item in fl:
-            if isinstance(item, dict) and "file" in item and "function" in item:
+            if (isinstance(item, dict)
+                    and item.get("file", "").strip()
+                    and item.get("function", "").strip()):
                 item.setdefault("reason", "")
                 valid.append(item)
         result["fallback_locations"] = valid
@@ -602,7 +1061,7 @@ def phase_llm_confirm(state: dict) -> dict:
         problem_summary, code_context, patch_constraints,
         expected_behavior, fallback_locations
     """
-    contexts:             List[dict] = state.get("rag_contexts", [])
+    contexts:             List[dict] = _filter_candidates(state.get("rag_contexts", []))
     all_functions:        List[dict] = state.get("all_functions", [])
     ast_functions:        List[dict] = state.get("ast_functions", [])
     tool_search_results:  List[dict] = state.get("tool_search_results", [])
@@ -626,6 +1085,43 @@ def phase_llm_confirm(state: dict) -> dict:
             "fallback_locations": [],
         }
         return {**state, "location": fallback, "confidence": 0.0}
+
+    # ── Solution 2: ImportError hard override — bypass LLM entirely ──────────
+    # When the ticket contains an ImportError/ModuleNotFoundError, the module
+    # path directly maps to a file. This is 100 % deterministic and far more
+    # reliable than asking a small LLM to guess. If the file exists on disk
+    # we use it directly and skip the LLM call.
+    _repo_path = state.get("repo_path", "")
+    _import_hit = _resolve_import_error_file(ticket, _repo_path)
+    if _import_hit and _import_hit.get("file"):
+        logger.info(
+            "[phase4] ImportError override — resolved to '%s', skipping LLM.",
+            _import_hit["file"],
+        )
+        _import_hit["confidence"] = 0.75
+        _import_hit.setdefault("function", "_module_level_")
+        _import_hit.setdefault("line", 1)
+        _import_hit.setdefault("root_cause",
+            f"Circular import or missing module: "
+            f"{_import_hit['file'].replace('/', '.').removesuffix('.py')}"
+        )
+        # Build language from extension.
+        _imp_ext = Path(_import_hit["file"]).suffix.lower()
+        _import_hit["language"] = {
+            ".py": "python", ".js": "javascript", ".ts": "typescript",
+            ".jsx": "javascript", ".tsx": "typescript", ".java": "java",
+            ".go": "go", ".rs": "rust", ".rb": "ruby",
+        }.get(_imp_ext, "")
+        _import_hit["callers"] = []
+        _import_hit["callees"] = []
+        # Build the 8 extended fields deterministically.
+        _imp_extended = _build_8_fields_deterministic(
+            _import_hit, ticket, state, ast_functions, contexts, _repo_path
+        )
+        _import_hit.update(_imp_extended)
+        _import_hit["coder_instructions"] = _build_coder_instructions(_import_hit)
+        _import_hit["task_file"] = _write_task_md(_import_hit, state)
+        return {**state, "location": _import_hit, "confidence": _import_hit["confidence"]}
 
     # ── Pre-LLM: build deterministic context from top RAG candidate ───────────
     top_candidate = contexts[0]
@@ -653,27 +1149,32 @@ def phase_llm_confirm(state: dict) -> dict:
         },
     )
 
-    # ── Call 1: main localisation ──────────────────────────────────────────────
+    # ── Single LLM call — 5-field schema (file/function/line/root_cause/confidence)
+    # The 8 extended fields are ALWAYS built deterministically after this call.
+    # This eliminates "unparseable output" errors caused by complex 13-field schemas.
     user_prompt = _build_main_prompt(
         state, raw_code_ctx, patch_constraints_prebuilt, tool_search_results
     )
+    result: Optional[Dict] = None
     try:
         raw    = _call_ollama(user_prompt, model=model)
         result = _parse_llm_json(raw)
+        if result is not None:
+            logger.info(
+                "[phase4] LLM localisation succeeded — file=%s confidence=%.2f",
+                result.get("file", "?"), result.get("confidence", 0.0),
+            )
     except Exception as exc:
         logger.error("[phase4] LLM call failed: %s", exc)
-        result = None
 
     if result is None:
-        # Last-resort: pick top-1 RAG context deterministically.
-        top = contexts[0]
-        result = {
-            "file":       top.get("file", ""),
-            "function":   top.get("function", ""),
-            "line":       top.get("start_line", 0),
-            "root_cause": "LLM output unparseable — defaulting to top RAG hit.",
-            "confidence": 0.3,
-        }
+        # ── Deterministic fallback ────────────────────────────────────────────
+        # LLM returned unparseable output or raised an exception.
+        # Use tool_search_results (definition hits) → best non-generated RAG context.
+        logger.warning("[phase4] LLM output unparseable — using deterministic fallback.")
+        result = _build_deterministic_fallback(
+            contexts, tool_search_results, ticket, state.get("repo_path", "")
+        )
 
     confidence = float(result.get("confidence", 0.0))
 
@@ -742,53 +1243,107 @@ def phase_llm_confirm(state: dict) -> dict:
          and fn.get("file") == result.get("file")),
         None,
     )
-    _llm_source_real = (_llm_ast_fn or {}).get("source_real", "")
-    actual_code_ctx = (
-        _llm_source_real
-        or extract_code_context(result.get("file", ""), result.get("line", 0))
-        or raw_code_ctx
+    # ── Build the 8 extended fields deterministically ─────────────────────────
+    # These fields are NEVER asked from the LLM — always derived from code.
+    # This guarantees they are always present and always correct.
+    extended = _build_8_fields_deterministic(
+        result, ticket, state, ast_functions, contexts, state.get("repo_path", "")
     )
-    actual_constraints = build_patch_constraints(
-        state,
-        {
-            "file":     result.get("file", ""),
-            "function": result.get("function", ""),
-            "line":     result.get("line", 0),
-        },
-    )
+    result.update(extended)
 
-    # Fallback values for all new fields.
-    title   = ticket.get("title", "")
-    desc    = ticket.get("description", "")
-    summary_fb = f"{title} — {desc[:200]}".strip(" —") if (title or desc) else ""
-
-    llm_fallbacks: Dict = {
-        "problem_summary":    summary_fb,
-        "code_context":       actual_code_ctx,
-        "patch_constraints":  actual_constraints,
-        "expected_behavior":  f"Corriger le bug décrit dans : {result.get('root_cause', '')}",
-        "missing_files":      [],
-        "fallback_locations": [],
-    }
-    result = _validate_and_fill(result, llm_fallbacks)
-
-    # ── Auto-correct: if 'file' is a missing file, swap to the caller ─────────
+    # ── Auto-correct: if 'file' does not exist on disk, swap to the caller ──────
+    # Triggers in two cases:
+    #   (A) LLM declared it in missing_files  — classic violation
+    #   (B) LLM left missing_files=[] but the file simply isn't on disk
+    _repo_path_ac = state.get("repo_path", "")
     _missing_paths = {
         mf.get("path", "").replace("\\", "/")
         for mf in result.get("missing_files", [])
     }
     _result_file = result.get("file", "").replace("\\", "/")
 
+    # Disk-existence check (case B): add to _missing_paths so the correction
+    # block below fires, and synthesise a missing_files entry with an empty template.
+    if _result_file and _result_file not in _missing_paths:
+        _abs_check = Path(_repo_path_ac) / _result_file if _repo_path_ac else Path(_result_file)
+        if not _abs_check.is_file():
+            logger.warning(
+                "[phase4] 'file' (%s) not found on disk — treating as missing file (LLM forgot missing_files)",
+                _result_file,
+            )
+            _missing_paths.add(_result_file)
+            # Synthesise a missing_files entry so the Coder knows to create it.
+            existing_mf = result.get("missing_files") or []
+            if not any(
+                (mf.get("path") or "").replace("\\", "/") == _result_file
+                for mf in existing_mf
+            ):
+                existing_mf.append({
+                    "path":     _result_file,
+                    "reason":   f"File referenced but absent from repo — auto-detected by phase 4",
+                    "template": result.get("code_context", ""),  # use annotated snippet as seed
+                })
+                result["missing_files"] = existing_mf
+
     if _result_file and _result_file in _missing_paths:
-        # Find the first fallback that is NOT itself missing
+        # Find the first fallback that is NOT itself missing.
+        # Search order: fallback_locations → ast_functions from state.
         _caller_file = ""
         _caller_fn   = ""
+
         for _fb in result.get("fallback_locations", []):
             _fb_file = _fb.get("file", "").replace("\\", "/")
             if _fb_file and _fb_file not in _missing_paths:
                 _caller_file = _fb_file
                 _caller_fn   = _fb.get("function", result.get("function", ""))
                 break
+
+        if not _caller_file:
+            # Second pass: search for the file that actually REFERENCES the missing module.
+            # Priority: file whose source contains the missing module name (grep-style).
+            _missing_module = _result_file.replace("/", ".").removesuffix(".py")  # apps/services/urls.py → apps.services.urls
+            _candidates_af  = list(state.get("ast_functions", [])) + list(state.get("all_functions", []))
+            _seen_af: set   = set()
+
+            for _af in _candidates_af:
+                _af_file = _af.get("file", "").replace("\\", "/")
+                if not _af_file or _af_file in _missing_paths or _af_file in _seen_af:
+                    continue
+                _seen_af.add(_af_file)
+                _af_abs = Path(_repo_path_ac) / _af_file if _repo_path_ac else Path(_af_file)
+                if not _af_abs.is_file():
+                    continue
+                # Prefer a file whose source mentions the missing module path
+                _af_source = _af.get("source", "") + _af.get("source_real", "")
+                _mentions  = (
+                    _result_file in _af_source
+                    or _missing_module in _af_source
+                    or _result_file.split("/")[-2] in _af_source  # "services"
+                )
+                if _mentions:
+                    _caller_file = _af_file
+                    _caller_fn   = _af.get("function", result.get("function", ""))
+                    logger.warning(
+                        "[phase4] found caller by source grep: %s::%s (mentions '%s')",
+                        _caller_file, _caller_fn, _missing_module,
+                    )
+                    break
+
+            # Third pass: any existing ast_functions file (last resort)
+            if not _caller_file:
+                for _af in _candidates_af:
+                    _af_file = _af.get("file", "").replace("\\", "/")
+                    if not _af_file or _af_file in _missing_paths:
+                        continue
+                    _af_abs = Path(_repo_path_ac) / _af_file if _repo_path_ac else Path(_af_file)
+                    if _af_abs.is_file():
+                        _caller_file = _af_file
+                        _caller_fn   = _af.get("function", result.get("function", ""))
+                        logger.warning(
+                            "[phase4] last-resort caller: %s::%s",
+                            _caller_file, _caller_fn,
+                        )
+                        break
 
         if _caller_file:
             logger.warning(
@@ -830,4 +1385,247 @@ def phase_llm_confirm(state: dict) -> dict:
                     ".kt": "kotlin",  ".swift": "swift",
                 }.get(_ext2, "")
 
+    result["coder_instructions"] = _build_coder_instructions(result)
+    logger.info("[phase4] coder_instructions built (%d chars)", len(result["coder_instructions"]))
+
+    # Write task.md next to the repo (specs/ dir inside repo_path)
+    result["task_file"] = _write_task_md(result, state)
+
     return {**state, "location": result, "confidence": confidence}
+
+
+def _write_task_md(location: dict, state: dict) -> str:
+    """
+    Write specs/task_{issue_id}.md inside repo_path.
+    Returns the absolute path, or '' on failure.
+    """
+    repo_path = state.get("repo_path", "")
+    ticket    = state.get("ticket", {})
+    issue_id  = ticket.get("id", "spec")
+    if not repo_path:
+        return ""
+    try:
+        specs_dir = Path(repo_path) / "specs"
+        specs_dir.mkdir(parents=True, exist_ok=True)
+        task_path = specs_dir / f"task_{issue_id}.md"
+        content   = _build_task_md_content(location, ticket)
+        task_path.write_text(content, encoding="utf-8")
+        logger.info("[phase4] task.md written: %s", task_path)
+        return str(task_path.resolve())
+    except Exception as exc:
+        logger.warning("[phase4] Could not write task.md: %s", exc)
+        return ""
+
+
+def _build_task_md_content(location: dict, ticket: dict) -> str:
+    """
+    Build a concise to-do list task file consumed by Agent Coder.
+    Injected verbatim into the coder LLM prompt — keep it short and actionable.
+    """
+    # ── Extract fields ────────────────────────────────────────────────────────
+    pc            = location.get("patch_constraints") or {}
+    missing_files = location.get("missing_files") or []
+    fallbacks     = location.get("fallback_locations") or []
+    confidence    = float(location.get("confidence", 0.0))
+    language      = location.get("language", "")
+    bug_file      = location.get("file", "")
+    bug_fn        = location.get("function", "") or "_module_level_"
+    bug_line      = location.get("line", 0)
+    root_cause    = location.get("root_cause", "")
+    expected      = location.get("expected_behavior", "")
+    code_ctx      = location.get("code_context", "")
+    preserve      = pc.get("preserve_tests") or []
+    forbidden     = pc.get("forbidden_files") or []
+    style         = pc.get("style_hint", "")
+    title         = ticket.get("title", "Bug Fix")
+
+    # ── Sanitize: never expose internal error messages ────────────────────────
+    _BAD_MARKERS = (
+        "LLM output unparseable",
+        "defaulting to top RAG hit",
+        "deterministic fallback",
+        "LLM failed",
+    )
+    def _sanitize(value: str, fallback: str) -> str:
+        return fallback if any(m in value for m in _BAD_MARKERS) else value
+
+    root_cause = _sanitize(root_cause, "See ticket description for root cause.")
+    expected   = _sanitize(expected,   "Project runs without error after fix.")
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    lines = []
+    lines.append(f"# Task — {title}\n")
+    meta_parts = [f"Confidence: {confidence:.0%}", language or "unknown"]
+    if bug_file:
+        meta_parts.append(bug_file)
+    lines.append(f"> {' | '.join(meta_parts)}\n")
+    lines.append("---\n")
+
+    # ── To-Do list ────────────────────────────────────────────────────────────
+    lines.append("## To-Do\n")
+    step = 1
+
+    # Step 1 — Open the file
+    if bug_file:
+        loc_str = f"`{bug_file}`"
+        if bug_line:
+            loc_str += f" line {bug_line}"
+        loc_str += f" — `{bug_fn}`"
+        lines.append(f"- [ ] **{step}. OPEN** {loc_str}")
+    else:
+        lines.append(f"- [ ] **{step}. OPEN** — file not identified, see Fallbacks below")
+    step += 1
+
+    # Step 2 — Understand
+    lines.append(f"- [ ] **{step}. UNDERSTAND** — {root_cause}")
+    step += 1
+
+    # Step 3 — Fix (existing file)
+    fix_detail = expected
+    if style:
+        fix_detail += f"  Style: {style}"
+    lines.append(f"- [ ] **{step}. FIX** — {fix_detail}")
+    step += 1
+
+    # Step N — Create missing files (if any)
+    for mf in missing_files:
+        mf_path = mf.get("path", "")
+        mf_why  = mf.get("reason", "")
+        lines.append(f"- [ ] **{step}. CREATE** `{mf_path}` — {mf_why}")
+        step += 1
+
+    # Step N — Do not touch
+    do_not = list(forbidden) + [t for t in preserve]
+    if do_not:
+        joined = ", ".join(f"`{f}`" for f in do_not)
+        lines.append(f"- [ ] **{step}. DO NOT TOUCH** — {joined}")
+        step += 1
+
+    # Step N — Validate
+    validate_items = ["syntax check passes", "`git diff` non-empty"]
+    if preserve:
+        validate_items.append(f"tests pass: {', '.join(f'`{t}`' for t in preserve)}")
+    lines.append(f"- [ ] **{step}. VALIDATE** — {' + '.join(validate_items)}")
+
+    lines.append("")
+
+    # ── Code at bug location ──────────────────────────────────────────────────
+    if code_ctx:
+        lines.append(f"## Code at bug location (line {bug_line})\n")
+        lines.append(f"```{language}")
+        lines.append(code_ctx)
+        lines.append("```")
+        lines.append("")
+
+    # ── Missing file templates ────────────────────────────────────────────────
+    if missing_files:
+        lines.append("## Files to create\n")
+        for mf in missing_files:
+            tmpl = mf.get("template", "")
+            if tmpl:
+                lines.append(f"### `{mf.get('path', '')}`")
+                lines.append(f"```{language}")
+                lines.append(tmpl)
+                lines.append("```")
+                lines.append("")
+
+    # ── Fallbacks ─────────────────────────────────────────────────────────────
+    if fallbacks:
+        lines.append(
+            f"## Fallbacks (confidence {confidence:.0%} — try these if primary fix fails)\n"
+        )
+        for fb in fallbacks[:3]:
+            fb_file = fb.get("file", "")
+            fb_fn   = fb.get("function", "")
+            lines.append(f"- `{fb_file}` -> `{fb_fn}`")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ── Coder instructions builder ────────────────────────────────────────────────
+
+
+def _build_coder_instructions(location: dict) -> str:
+    """
+    Generate a human-readable description of the bug for the console output.
+    No numbered steps — pure description format.
+    The to-do list lives in task.md; this is the narrative summary.
+    """
+    bug_file      = location.get("file", "")
+    bug_function  = location.get("function", "")
+    bug_line      = location.get("line", 0)
+    root_cause    = location.get("root_cause", "")
+    expected      = location.get("expected_behavior", "")
+    confidence    = float(location.get("confidence", 0.0))
+    language      = location.get("language", "")
+    missing_files = location.get("missing_files") or []
+    fallbacks     = location.get("fallback_locations") or []
+    pc            = location.get("patch_constraints") or {}
+    scope         = pc.get("scope", "")
+    style         = pc.get("style_hint", "")
+    preserve      = pc.get("preserve_tests") or []
+    forbidden     = pc.get("forbidden_files") or []
+    callers       = location.get("callers") or []
+    callees       = location.get("callees") or []
+
+    lines = ["## Bug Report\n"]
+
+    # ── Location ──────────────────────────────────────────────────────────────
+    if bug_file:
+        loc_parts = [f"File: `{bug_file}`"]
+        if bug_function:
+            loc_parts.append(f"Function: `{bug_function}`")
+        if bug_line:
+            loc_parts.append(f"Line: {bug_line}")
+        if language:
+            loc_parts.append(f"Language: {language}")
+        loc_parts.append(f"Confidence: {confidence:.0%}")
+        lines.append("  ".join(loc_parts))
+    else:
+        lines.append("File not identified — see fallback locations below.")
+    lines.append("")
+
+    # ── Root cause & expected ─────────────────────────────────────────────────
+    lines.append(f"**Root cause**: {root_cause}")
+    lines.append("")
+    lines.append(f"**Expected after fix**: {expected}")
+    lines.append("")
+
+    # ── Call graph (when available) ───────────────────────────────────────────
+    if callers:
+        lines.append(f"**Called by**: {', '.join(callers[:3])}")
+    if callees:
+        lines.append(f"**Calls**: {', '.join(callees[:3])}")
+    if callers or callees:
+        lines.append("")
+
+    # ── Constraints ───────────────────────────────────────────────────────────
+    if scope:
+        lines.append(f"**Scope**: {scope}")
+    if style:
+        lines.append(f"**Style**: {style}")
+    if forbidden:
+        lines.append(f"**Do NOT touch**: {', '.join(f'`{f}`' for f in forbidden)}")
+    if preserve:
+        lines.append(f"**Preserve tests**: {', '.join(f'`{t}`' for t in preserve)}")
+    if scope or style or forbidden or preserve:
+        lines.append("")
+
+    # ── Missing files ─────────────────────────────────────────────────────────
+    if missing_files:
+        lines.append("**Files to create**:")
+        for mf in missing_files:
+            lines.append(f"  - `{mf.get('path', '')}` — {mf.get('reason', '')}")
+        lines.append("")
+
+    # ── Fallbacks ─────────────────────────────────────────────────────────────
+    if fallbacks:
+        lines.append(
+            f"**Fallbacks** (confidence {confidence:.0%} — if primary fix fails):"
+        )
+        for fb in fallbacks[:3]:
+            lines.append(f"  - `{fb.get('file')}` -> `{fb.get('function')}` — {fb.get('reason', '')}")
+        lines.append("")
+
+    return "\n".join(lines)

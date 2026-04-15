@@ -56,15 +56,16 @@ class SpecState(TypedDict):
     tool_search_results: list
 
     # ── Phase 4 — LLM + Reflexion ─────────────────────────────────────────────
-    # Full location document for the Agent Coder.  All 13 fields:
+    # Full location document for the Agent Coder.  All 14 fields:
     #   Existing : file, function, line, root_cause, confidence,
     #              callers, callees, language
-    #   New      : problem_summary   — structured 3-sentence bug description
-    #              code_context      — annotated snippet with # BUG: comments
-    #              patch_constraints — {scope, preserve_tests,
-    #                                   forbidden_files, style_hint}
-    #              expected_behavior — what the code should do after the patch
+    #   New      : problem_summary    — structured 3-sentence bug description
+    #              code_context       — annotated snippet with # BUG: comments
+    #              patch_constraints  — {scope, preserve_tests,
+    #                                    forbidden_files, style_hint}
+    #              expected_behavior  — what the code should do after the patch
     #              fallback_locations — [{file, function, reason}, …]
+    #              coder_instructions — deterministic step-by-step guide for Coder
     location: dict
     confidence: float
 

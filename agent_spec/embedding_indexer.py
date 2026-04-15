@@ -28,7 +28,7 @@ CHUNK_OVERLAP = 10   # overlap between consecutive chunks
 EMBED_BATCH   = 32   # sentences per encode() call
 UPSERT_BATCH  = 512  # max chunks per Chroma add() call
 
-MODEL_ID    = os.environ.get("EMBEDDING_MODEL", "Salesforce/codet5p-110m-embedding")
+MODEL_ID    = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 CHROMA_PATH = os.environ.get(
     "CHROMA_PERSIST_PATH",
     str(Path.home() / ".cache" / "spec_agent" / "chroma"),
