@@ -2,11 +2,11 @@
 Phase 3 — RAG with cAST Chunking
 ==================================
 Embeds the top-5 function bodies (cAST chunks — one chunk = one function, never
-split mid-function) using Salesforce/codet5p-110m-embedding, stores them in an
-ephemeral Chroma collection, then returns the top-3 most semantically relevant
+split mid-function) using fastembed (ONNX — no PyTorch required), stores them in
+an ephemeral Chroma collection, then returns the top-3 most semantically relevant
 contexts for the Phase-4 LLM.
 
-No LLM.  GPU optional (CPU fallback available).
+No LLM.  No GPU required.
 """
 
 import logging
@@ -14,32 +14,6 @@ import re
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
-
-# Lazy-loaded heavy dependencies so import errors are isolated.
-_embedding_model = None
-# Override with EMBEDDING_MODEL env var.
-# Default: all-MiniLM-L6-v2 (fast, already widely cached).
-# For production code quality: Salesforce/codet5p-110m-embedding (requires trust_remote_code=True).
-import os as _os
-_MODEL_ID = _os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-
-
-def _get_embedding_model():
-    """Load the embedding model once (lazy singleton).
-
-    Uses transformers direct loading for codet5p (sentence-transformers incompatible),
-    SentenceTransformer for everything else.
-    """
-    global _embedding_model
-    if _embedding_model is None:
-        if "codet5p" in _MODEL_ID.lower():
-            # Import the shared encoder from embedding_indexer to avoid duplication.
-            from .embedding_indexer import _CodeT5pEncoder
-            _embedding_model = _CodeT5pEncoder(_MODEL_ID)
-        else:
-            from sentence_transformers import SentenceTransformer
-            _embedding_model = SentenceTransformer(_MODEL_ID)
-    return _embedding_model
 
 
 # ── Query builder ──────────────────────────────────────────────────────────────
@@ -102,7 +76,7 @@ def _semantic_rerank(
     top_k: int = 3,
 ) -> List[dict]:
     """
-    Embed all function chunks + query with codet5p, store in an ephemeral Chroma
+    Embed all function chunks + query with fastembed, store in an ephemeral Chroma
     collection, retrieve top-k by cosine similarity.
 
     Falls back to BM25-style keyword overlap if embeddings are unavailable.
@@ -110,15 +84,15 @@ def _semantic_rerank(
     try:
         import chromadb
 
-        model = _get_embedding_model()
+        from .embedding_indexer import _embed
         documents = [_make_chunk_document(fn) for fn in functions]
 
         # Embed all chunks + the query in one batch for efficiency.
-        all_texts = documents + [query]
-        embeddings = model.encode(all_texts, batch_size=8, show_progress_bar=False)
+        all_texts  = documents + [query]
+        embeddings = _embed(all_texts)
 
         chunk_embeddings = [emb.tolist() for emb in embeddings[:-1]]
-        query_embedding = embeddings[-1].tolist()
+        query_embedding  = embeddings[-1].tolist()
 
         # EphemeralClient crée une instance totalement isolée par appel —
         # évite les conflits de tenant quand plusieurs requêtes tournent en parallèle.

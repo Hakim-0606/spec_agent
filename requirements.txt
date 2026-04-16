@@ -2,7 +2,7 @@
 langgraph>=0.2.50
 langchain-core>=0.2.0
 
-# ── Phase 1 — BM25 + Embeddings + RRF ────────────────────────────────────────
+# ── Phase 1 — BM25 + RRF ─────────────────────────────────────────────────────
 rank-bm25>=0.2.2
 
 # ── Phase 2 — AST parsing + call graph + diff signal ─────────────────────────
@@ -27,13 +27,10 @@ tree-sitter-swift>=0.5
 networkx>=3.3
 
 # ── Phase 3 — RAG + vector store ─────────────────────────────────────────────
-sentence-transformers>=3.0.0
+# fastembed: ONNX-based embeddings — no PyTorch, no GPU required (~15 MB runtime + 33 MB model)
+# Replaces sentence-transformers + torch + transformers + accelerate
+fastembed>=0.3.0
 chromadb>=0.5.0
-# torch + transformers are pulled in by sentence-transformers;
-# pin them explicitly to avoid silent downgrades.
-#torch>=2.3.0
-transformers>=4.40.0
-accelerate>=0.30.0
 
 # ── Phase 4 — LLM local via Ollama ───────────────────────────────────────────
 ollama>=0.3.0

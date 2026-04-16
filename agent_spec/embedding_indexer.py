@@ -6,7 +6,7 @@ Provides:
     - search(query, repo_id, top_k)   → top-k files by semantic similarity
 
 Chunking  : 50 lines per chunk, 10 lines overlap.
-Model     : all-MiniLM-L6-v2 (singleton, loaded once at first use).
+Model     : BAAI/bge-small-en-v1.5 via fastembed (ONNX — no PyTorch required).
 Cache     : re-indexing is skipped when git HEAD commit hash is unchanged.
 """
 
@@ -25,10 +25,12 @@ from .constants import SKIP_DIRS, SUPPORTED_EXTENSIONS
 
 CHUNK_SIZE    = 50   # lines per chunk
 CHUNK_OVERLAP = 10   # overlap between consecutive chunks
-EMBED_BATCH   = 32   # sentences per encode() call
 UPSERT_BATCH  = 512  # max chunks per Chroma add() call
 
-MODEL_ID    = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+# fastembed model — overridable via env var.
+# BAAI/bge-small-en-v1.5 : 33 MB, 384 dims, better quality than all-MiniLM-L6-v2.
+# Other supported options : "sentence-transformers/all-MiniLM-L6-v2" (23 MB)
+MODEL_ID    = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 CHROMA_PATH = os.environ.get(
     "CHROMA_PERSIST_PATH",
     str(Path.home() / ".cache" / "spec_agent" / "chroma"),
@@ -39,68 +41,24 @@ CHROMA_PATH = os.environ.get(
 _embedding_model = None
 
 
-class _CodeT5pEncoder:
-    """
-    Thin wrapper around Salesforce/codet5p-110m-embedding loaded via transformers.
-    Exposes the same .encode(texts, batch_size, show_progress_bar) interface as
-    SentenceTransformer so the rest of the code is unchanged.
-    codet5p cannot be loaded through sentence-transformers because its custom config
-    conflicts with the SentenceTransformer wrapper (missing 'is_decoder' attribute).
-    """
-
-    def __init__(self, model_id: str):
-        import torch
-        from transformers import AutoModel, AutoTokenizer
-        logger.info(f"[EmbeddingIndexer] Loading codet5p via transformers: '{model_id}'…")
-        self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        self._model     = AutoModel.from_pretrained(model_id, trust_remote_code=True)
-        self._model.eval()
-        self._torch = torch
-        logger.info("[EmbeddingIndexer] codet5p model ready.")
-
-    def encode(
-        self,
-        sentences,
-        batch_size: int = 32,
-        show_progress_bar: bool = False,
-        **_,
-    ):
-        import numpy as np
-        torch = self._torch
-        all_embeddings = []
-        for i in range(0, len(sentences), batch_size):
-            batch = sentences[i : i + batch_size]
-            inputs = self._tokenizer(
-                batch,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-            )
-            with torch.no_grad():
-                outputs = self._model(**inputs)
-            # codet5p returns the embedding at position 0 (pooled representation)
-            embeddings = outputs.last_hidden_state[:, 0, :]
-            all_embeddings.append(embeddings.cpu().numpy())
-        return np.vstack(all_embeddings)
-
-
 def _get_model():
-    """Load the embedding model once (module-level singleton).
-
-    Uses _CodeT5pEncoder for Salesforce/codet5p-110m-embedding (transformers direct),
-    and SentenceTransformer for all other models.
+    """
+    Load the fastembed TextEmbedding model once (module-level singleton).
+    fastembed uses ONNX Runtime — no PyTorch dependency.
     """
     global _embedding_model
     if _embedding_model is None:
-        logger.info(f"[EmbeddingIndexer] Loading model '{MODEL_ID}'…")
-        if "codet5p" in MODEL_ID.lower():
-            _embedding_model = _CodeT5pEncoder(MODEL_ID)
-        else:
-            from sentence_transformers import SentenceTransformer
-            _embedding_model = SentenceTransformer(MODEL_ID)
-            logger.info("[EmbeddingIndexer] Model ready.")
+        from fastembed import TextEmbedding
+        logger.info("[EmbeddingIndexer] Loading fastembed model '%s'...", MODEL_ID)
+        _embedding_model = TextEmbedding(model_name=MODEL_ID)
+        logger.info("[EmbeddingIndexer] Model ready.")
     return _embedding_model
+
+
+def _embed(texts: List[str]) -> List:
+    """Embed a list of texts. Returns a list of numpy arrays."""
+    model = _get_model()
+    return list(model.embed(texts))
 
 
 # ── Git helpers ────────────────────────────────────────────────────────────────
@@ -165,7 +123,7 @@ class EmbeddingIndexer:
 
     search(query, repo_id, top_k)
         Semantic nearest-neighbour search.
-        Returns [{file, embed_score}, …] deduplicated by file, best-score kept.
+        Returns [{file, embed_score}, ...] deduplicated by file, best-score kept.
     """
 
     def __init__(self, persist_path: str = CHROMA_PATH):
@@ -192,7 +150,6 @@ class EmbeddingIndexer:
         return self._sanitise(repo_id)
 
     def _meta_col_name(self, repo_id: str) -> str:
-        # keep under 63 chars
         return self._sanitise(repo_id)[:57] + "_meta"
 
     # ── Commit-hash cache ──────────────────────────────────────────────────────
@@ -222,7 +179,7 @@ class EmbeddingIndexer:
                 col = client.create_collection(meta_col)
             col.upsert(ids=["commit_hash"], documents=[commit_hash])
         except Exception as exc:
-            logger.warning(f"[EmbeddingIndexer] Could not persist commit hash: {exc}")
+            logger.warning("[EmbeddingIndexer] Could not persist commit hash: %s", exc)
 
     # ── Indexing ───────────────────────────────────────────────────────────────
 
@@ -237,19 +194,18 @@ class EmbeddingIndexer:
 
         if current_commit and current_commit == stored_commit:
             logger.info(
-                f"[EmbeddingIndexer] Index up to date "
-                f"(commit {current_commit[:8]}) — skipping."
+                "[EmbeddingIndexer] Index up to date (commit %s) — skipping.",
+                current_commit[:8],
             )
             return False
 
         logger.info(
-            f"[EmbeddingIndexer] Indexing repo '{repo_id}' "
-            f"@ {current_commit[:8] or 'unknown'}…"
+            "[EmbeddingIndexer] Indexing repo '%s' @ %s...",
+            repo_id, current_commit[:8] or "unknown",
         )
 
         try:
-            model  = _get_model()
-            client = self._get_client()
+            client   = self._get_client()
             col_name = self._col_name(repo_id)
 
             # Full re-index: drop stale collection if present.
@@ -276,11 +232,9 @@ class EmbeddingIndexer:
 
             # Batch-embed and upsert.
             for start in range(0, len(all_chunks), UPSERT_BATCH):
-                batch = all_chunks[start : start + UPSERT_BATCH]
-                texts = [c["text"] for c in batch]
-                embeddings = model.encode(
-                    texts, batch_size=EMBED_BATCH, show_progress_bar=False
-                )
+                batch      = all_chunks[start : start + UPSERT_BATCH]
+                texts      = [c["text"] for c in batch]
+                embeddings = _embed(texts)
                 collection.add(
                     ids        = [c["chunk_id"]   for c in batch],
                     documents  = texts,
@@ -291,17 +245,19 @@ class EmbeddingIndexer:
                     ],
                 )
                 logger.debug(
-                    f"[EmbeddingIndexer] {start + len(batch)}/{len(all_chunks)} chunks indexed"
+                    "[EmbeddingIndexer] %d/%d chunks indexed",
+                    start + len(batch), len(all_chunks),
                 )
 
             self._store_commit(repo_id, current_commit)
             logger.info(
-                f"[EmbeddingIndexer] Done — {len(all_chunks)} chunks stored for '{repo_id}'."
+                "[EmbeddingIndexer] Done — %d chunks stored for '%s'.",
+                len(all_chunks), repo_id,
             )
             return True
 
         except Exception as exc:
-            logger.warning(f"[EmbeddingIndexer] Indexing failed: {exc}")
+            logger.warning("[EmbeddingIndexer] Indexing failed: %s", exc)
             return False
 
     # ── Search ─────────────────────────────────────────────────────────────────
@@ -310,20 +266,19 @@ class EmbeddingIndexer:
         """
         Semantic search over the indexed repo.
 
-        Returns [{file: str, embed_score: float}, …] deduplicated by file
+        Returns [{file: str, embed_score: float}, ...] deduplicated by file
         (best score per file kept), sorted descending.
         Falls back to [] if the index is unavailable.
         """
         try:
-            model    = _get_model()
             client   = self._get_client()
             col_name = self._col_name(repo_id)
 
             existing = [c.name for c in client.list_collections()]
             if col_name not in existing:
                 logger.warning(
-                    f"[EmbeddingIndexer] Collection '{col_name}' not found "
-                    "— call index_repo first."
+                    "[EmbeddingIndexer] Collection '%s' not found — call index_repo first.",
+                    col_name,
                 )
                 return []
 
@@ -333,8 +288,8 @@ class EmbeddingIndexer:
                 return []
 
             # Over-fetch to allow per-file deduplication.
-            n_results      = min(top_k * 5, total)
-            query_embedding = model.encode([query], show_progress_bar=False)[0].tolist()
+            n_results       = min(top_k * 5, total)
+            query_embedding = _embed([query])[0].tolist()
 
             results = collection.query(
                 query_embeddings=[query_embedding],
@@ -346,7 +301,7 @@ class EmbeddingIndexer:
             best: Dict[str, float] = {}
             for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
                 fpath = meta.get("file", "")
-                score = float(1.0 - dist / 2.0)   # distance ∈ [0,2] → similarity ∈ [0,1]
+                score = float(1.0 - dist / 2.0)   # distance in [0,2] -> similarity in [0,1]
                 if fpath not in best or score > best[fpath]:
                     best[fpath] = score
 
@@ -354,7 +309,7 @@ class EmbeddingIndexer:
             return [{"file": f, "embed_score": s} for f, s in ranked[:top_k]]
 
         except Exception as exc:
-            logger.warning(f"[EmbeddingIndexer] Search failed: {exc}")
+            logger.warning("[EmbeddingIndexer] Search failed: %s", exc)
             return []
 
 
